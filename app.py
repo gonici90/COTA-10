@@ -7,9 +7,9 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="COTA 10 Football Analyzer", version="1.3")
-API_KEY = os.getenv("API_FOOTBALL_KEY", "")
-API_BASE = "https://v3.football.api-sports.io"
+app = FastAPI(title="COTA 10 Football Analyzer", version="2.0")
+API_KEY = os.getenv("FOOTBALLDATA_API_KEY") or os.getenv("API_FOOTBALL_KEY", "")
+API_BASE = "https://footballdata.io/api/v1"
 
 
 def poisson_over_25(expected_goals: float) -> float:
@@ -17,73 +17,83 @@ def poisson_over_25(expected_goals: float) -> float:
     return max(0.0, min(1.0, 1.0 - p_under))
 
 
-async def api_get_full(path: str, params: dict):
+async def api_get(path: str, params: dict | None = None):
     if not API_KEY:
-        raise HTTPException(500, "API_FOOTBALL_KEY is not configured on Render")
+        raise HTTPException(500, "FOOTBALLDATA_API_KEY is not configured on Render")
     async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.get(API_BASE + path, params=params, headers={"x-apisports-key": API_KEY})
+        r = await client.get(API_BASE + path, params=params or {}, headers={"Authorization": f"Bearer {API_KEY}"})
     if r.status_code != 200:
-        raise HTTPException(502, f"API-Football returned HTTP {r.status_code}: {r.text[:300]}")
+        raise HTTPException(502, f"Footballdata.io returned HTTP {r.status_code}: {r.text[:300]}")
     data = r.json()
-    if data.get("errors"):
-        raise HTTPException(502, f"API-Football error: {data['errors']}")
+    if data.get("success") is False:
+        raise HTTPException(502, f"Footballdata.io error: {data.get('error', data)}")
     return data
 
 
-async def api_get(path: str, params: dict):
-    return (await api_get_full(path, params)).get("response", [])
+def extract_matches(data):
+    payload = data.get("data", [])
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("matches", "fixtures", "results"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+    return []
 
 
-async def recent_team_stats(team_id: int, league_id: int, season: int, before_day: str, last: int = 8):
-    # Free API-Football requires season for team fixture history and does not
-    # allow the `last` parameter. Restrict by league+season and trim locally.
-    games = await api_get("/fixtures", {
-        "team": team_id,
-        "league": league_id,
-        "season": season,
-        "from": f"{season}-01-01",
-        "to": before_day,
-    })
-    completed = []
-    for g in games:
-        goals = g.get("goals", {})
-        if goals.get("home") is None or goals.get("away") is None:
+def team_info(match, side):
+    obj = match.get(f"{side}_team") or match.get(side) or {}
+    return {"id": obj.get("team_id") or obj.get("id"), "name": obj.get("team_name") or obj.get("name") or "?"}
+
+
+def score_values(match):
+    score = match.get("score") or match.get("scores") or {}
+    h = score.get("home") if isinstance(score, dict) else None
+    a = score.get("away") if isinstance(score, dict) else None
+    if h is None: h = match.get("home_score")
+    if a is None: a = match.get("away_score")
+    try: h = int(h) if h is not None else None
+    except Exception: h = None
+    try: a = int(a) if a is not None else None
+    except Exception: a = None
+    return h, a
+
+
+async def recent_team_stats(team_id: int, before_day: str, last: int = 8):
+    data = await api_get("/matches", {"team_id": team_id, "to": before_day, "limit": 30})
+    games = []
+    for g in extract_matches(data):
+        h, a = score_values(g)
+        if h is None or a is None:
             continue
-        status = g.get("fixture", {}).get("status", {}).get("short")
-        if status in {"NS", "TBD", "PST", "CANC", "ABD"}:
-            continue
-        completed.append(g)
-    completed.sort(key=lambda g: g.get("fixture", {}).get("timestamp", 0), reverse=True)
-    games = completed[:last]
+        games.append(g)
+    games.sort(key=lambda g: str(g.get("date") or g.get("match_date") or g.get("kickoff") or ""), reverse=True)
+    games = games[:last]
     scored = conceded = played = over25 = 0
     for g in games:
-        h, a = g["goals"]["home"], g["goals"]["away"]
-        home_id = g["teams"]["home"]["id"]
-        gf, ga = (h, a) if home_id == team_id else (a, h)
-        scored += gf
-        conceded += ga
-        played += 1
-        over25 += int(h + a >= 3)
+        h, a = score_values(g)
+        home = team_info(g, "home")
+        gf, ga = (h, a) if home["id"] == team_id else (a, h)
+        scored += gf; conceded += ga; played += 1; over25 += int(h + a >= 3)
     if not played:
         return {"played": 0, "gf": 1.2, "ga": 1.2, "over25_rate": 0.5}
     return {"played": played, "gf": scored / played, "ga": conceded / played, "over25_rate": over25 / played}
 
 
 async def analyze_fixture(f, day: str):
-    home = f["teams"]["home"]
-    away = f["teams"]["away"]
-    league = f.get("league", {})
-    league_id = league.get("id")
-    season = league.get("season") or int(day[:4])
-    hs = await recent_team_stats(home["id"], league_id, season, day)
-    aws = await recent_team_stats(away["id"], league_id, season, day)
+    home, away = team_info(f, "home"), team_info(f, "away")
+    if not home["id"] or not away["id"]:
+        raise ValueError("team_id lipsă în răspunsul API")
+    hs = await recent_team_stats(home["id"], day)
+    aws = await recent_team_stats(away["id"], day)
     home_xg = (hs["gf"] + aws["ga"]) / 2
     away_xg = (aws["gf"] + hs["ga"]) / 2
     expected = max(0.4, min(5.5, home_xg + away_xg))
     poisson = poisson_over_25(expected)
     form_rate = (hs["over25_rate"] + aws["over25_rate"]) / 2
     probability = max(0.05, min(0.95, 0.70 * poisson + 0.30 * form_rate))
-    return {"fixture_id": f["fixture"]["id"], "kickoff": f["fixture"]["date"], "league": league["name"], "country": league["country"], "home": home["name"], "away": away["name"], "expected_goals": round(expected, 2), "over25_probability": round(probability * 100, 1), "fair_odds": round(1 / probability, 2), "home_last": hs["played"], "away_last": aws["played"]}
+    league = f.get("league") or {}
+    return {"fixture_id": f.get("match_id") or f.get("id"), "kickoff": f.get("date") or f.get("match_date") or f.get("kickoff"), "league": league.get("name") or f.get("league_name") or "", "country": league.get("country") or f.get("country") or "", "home": home["name"], "away": away["name"], "expected_goals": round(expected, 2), "over25_probability": round(probability * 100, 1), "fair_odds": round(1 / probability, 2), "home_last": hs["played"], "away_last": aws["played"]}
 
 
 def build_target_combo(matches, target=10.0):
@@ -102,32 +112,28 @@ def build_target_combo(matches, target=10.0):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "api_key_configured": bool(API_KEY), "version": "1.3"}
+    return {"status": "ok", "provider": "footballdata.io", "api_key_configured": bool(API_KEY), "version": "2.0"}
 
 
 @app.get("/api/analyze")
 async def analyze(day: str = Query(default_factory=lambda: date.today().isoformat()), limit: int = 8, target: float = 10.0):
-    raw = await api_get_full("/fixtures", {"date": day})
-    fixtures = raw.get("response", [])
+    raw = await api_get(f"/matches/date/{day}", {"limit": 100})
+    fixtures = extract_matches(raw)
     status_counts = {}
     for f in fixtures:
-        s = f.get("fixture", {}).get("status", {}).get("short", "UNKNOWN")
+        s = str(f.get("status") or "UNKNOWN")
         status_counts[s] = status_counts.get(s, 0) + 1
-    # Keep the free-plan request count under control: 1 fixtures request plus
-    # two history requests per analyzed match. Default to 8 candidates.
-    upcoming = [f for f in fixtures if f.get("fixture", {}).get("status", {}).get("short") in {"NS", "TBD", "PST"}][:max(1, min(limit, 8))]
+    upcoming = [f for f in fixtures if str(f.get("status", "")).lower() not in {"complete", "finished", "ft", "cancelled", "canceled", "postponed"}][:max(1, min(limit, 8))]
     results, errors = [], []
     for f in upcoming:
         try:
             results.append(await analyze_fixture(f, day))
         except Exception as exc:
-            errors.append({"fixture": f"{f.get('teams',{}).get('home',{}).get('name','?')} - {f.get('teams',{}).get('away',{}).get('name','?')}", "error": str(exc)[:250]})
-            # A rate-limit response means further calls in this run will also
-            # fail, so stop instead of burning more quota.
-            if "429" in str(exc) or "rateLimit" in str(exc):
-                break
+            h, a = team_info(f, "home"), team_info(f, "away")
+            errors.append({"fixture": f"{h['name']} - {a['name']}", "error": str(exc)[:250]})
+            if "429" in str(exc): break
     results.sort(key=lambda x: x["over25_probability"], reverse=True)
-    return {"date": day, "market": "Over 2.5 goals", "api_fixtures": len(fixtures), "status_counts": status_counts, "eligible": len(upcoming), "analyzed": len(results), "analysis_errors": errors[:10], "api_paging": raw.get("paging", {}), "target": target, "ranking": results, "suggested_combo": build_target_combo(results, target)}
+    return {"date": day, "market": "Over 2.5 goals", "api_fixtures": len(fixtures), "status_counts": status_counts, "eligible": len(upcoming), "analyzed": len(results), "analysis_errors": errors[:10], "target": target, "ranking": results, "suggested_combo": build_target_combo(results, target)}
 
 
 @app.get("/", response_class=HTMLResponse)
