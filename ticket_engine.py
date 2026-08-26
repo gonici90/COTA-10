@@ -3,6 +3,16 @@ from itertools import combinations
 
 import offline_backtest as ob
 
+# Add the previous Big 5 season as walk-forward history. The 2025/26 files
+# remain the newest data, while 2024/25 gives the model a proper warm-up.
+ob.LEAGUES.update({
+    'E0 3.csv': 'Premier League',
+    'SP1 2.csv': 'La Liga',
+    'I1 2.csv': 'Serie A',
+    'D1 2.csv': 'Bundesliga',
+    'F1 2.csv': 'Ligue 1',
+})
+
 
 def _trusted_source(p):
     if p.get('odds_source') == 'historical':
@@ -78,20 +88,12 @@ _original_run_backtest = ob.run_backtest
 def run_backtest_with_targets(days=90):
     result = _original_run_backtest(days)
     picks = list(reversed(result.get('recent', []))) if False else None
-    # Re-run only the historical selection pass is unnecessary; expose 1.50 by
-    # temporarily extending the target list through a small wrapper below.
     return result
 
-# Patch the original function's target tuple without duplicating its large engine.
-# The source uses a fixed tuple (2,5,10), so wrap _ticket_backtest and add 1.5
-# after the normal result using selections collected during a lightweight second pass.
 def _run(days=90):
     result = _original_run_backtest(days)
-    # Build 1.50 from the same walk-forward picks returned in recent when the
-    # period is <=30; for 90d we need all picks, so use a collector around summary.
     return result
 
-# Clean solution: replace the function constant tuple at runtime.
 try:
     consts = list(_original_run_backtest.__code__.co_consts)
     idx = consts.index((2, 5, 10))
