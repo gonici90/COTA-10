@@ -1,6 +1,7 @@
 import csv, math
 from collections import defaultdict, deque
 from datetime import datetime,timedelta
+from itertools import combinations
 from pathlib import Path
 from fastapi import APIRouter,HTTPException,Query
 router=APIRouter()
@@ -73,6 +74,29 @@ def _gate(db,league,market):
  if len(s)<10:return 0.,0.,len(s),0.
  wins=sum(x[0] for x in s);pr=sum(x[2] for x in s);hit=(wins+3)/(len(s)+6);roi=pr/len(s);conf=min(1.,len(s)/35);score=(hit-.72)*100*.55+roi*100*.45
  return hit,roi,len(s),score*conf
+def _ticket_for_day(day_picks,target):
+ # One selection per match already exists in day_picks. Find the safest combo close to target.
+ pool=sorted(day_picks,key=lambda p:(p['probability'],p.get('ev',0)),reverse=True)[:16];best=None
+ for z in range(1,min(8,len(pool))+1):
+  for c in combinations(pool,z):
+   odd=math.prod(p['odds'] for p in c)
+   if odd<target*.80 or odd>target*1.30:continue
+   avgp=sum(p['probability'] for p in c)/z
+   score=abs(math.log(odd/target))-avgp/800
+   if best is None or score<best[0]:best=(score,odd,c)
+ if not best:return None
+ _,odd,c=best;won=all(p['won'] for p in c);profit=odd-1 if won else -1
+ return {'date':c[0]['date'],'target':target,'odds':round(odd,2),'legs':len(c),'won':won,'profit':round(profit,2),'selections':[{'match':p['match'],'market':p['market'],'odds':p['odds'],'probability':p['probability'],'won':p['won']} for p in c]}
+def _ticket_backtest(picks,target):
+ byday=defaultdict(list)
+ for p in picks:byday[p['date']].append(p)
+ tickets=[];bank=0.;curve=[]
+ for d in sorted(byday):
+  t=_ticket_for_day(byday[d],target)
+  if not t:continue
+  tickets.append(t);bank+=t['profit'];curve.append({'date':d,'bankroll':round(bank,2),'won':t['won'],'odds':t['odds']})
+ n=len(tickets);w=sum(t['won'] for t in tickets);profit=sum(t['profit'] for t in tickets)
+ return {'target':target,'tickets':n,'wins':w,'losses':n-w,'hit_rate':round(100*w/n,1) if n else 0,'profit':round(profit,2),'roi':round(100*profit/n,1) if n else 0,'avg_odds':round(sum(t['odds'] for t in tickets)/n,2) if n else 0,'bankroll_curve':curve,'recent_tickets':tickets[-20:][::-1]}
 def run_backtest(days=90):
  rows=_load();last=max(r['_date'] for r in rows);cut=last-timedelta(days=days-1);hist={k:[] for k in LEAGUES.values()};perf=defaultdict(lambda:deque(maxlen=80));pickperf=defaultdict(lambda:deque(maxlen=60));picks=[];considered=0
  for r in rows:
@@ -97,7 +121,6 @@ def run_backtest(days=90):
      if (len(cand)==1 or best[0]-cand[1][0]>=3.0) and best[1]>=.70:
       _,p,m,o,ev,src,adj,nrel,trail_roi,trail_n=best;won=_won(m,r['_hg'],r['_ag']);profit=o-1 if won else -1
       picks.append({'date':r['_date'].isoformat(),'league':r['_league'],'match':r['HomeTeam']+' - '+r['AwayTeam'],'market':m,'probability':round(p*100,1),'estimated':round(p*100,1),'gap':round(adj*100,1),'reliability_sample':nrel,'trail_roi':round(trail_roi*100,1),'trail_sample':trail_n,'odds':round(o,2),'odds_source':src,'ev':round(ev,1),'result':f"{r['_hg']}-{r['_ag']}",'won':won,'profit':round(profit,2)})
-   # Update only after the current match was scored: strict walk-forward, no future leakage.
    for m,p0 in raw.items():
     w=int(_won(m,r['_hg'],r['_ag']));perf[(r['_league'],m)].append((w,p0));perf[('*',m)].append((w,p0));o=odds.get(m)
     if o and o>1:
@@ -109,6 +132,7 @@ def run_backtest(days=90):
  buckets={}
  for name,lo,hi in [('60-69',60,70),('70-79',70,80),('80-89',80,90),('90+',90,101)]:
   bp=[p for p in picks if lo<=p['probability']<hi];s=_summary(bp);est=round(sum(p['probability'] for p in bp)/len(bp),1) if bp else None;corr=round(s['hit_rate']-est,1) if bp else None;s['estimated']=est;s['correction_pp']=corr;s['correction']=corr;buckets[name]=s
- return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 walk-forward. Fiecare liga/piata este calibrata numai din trecut; selectia foloseste si performanta/ROI trailing a aceleiasi ligi+piete, cu penalizare/blocare pentru segmente persistent negative. Fara look-ahead. Cotele derivate raman doar proxy de diagnostic.'}
+ ticket_tests={str(t):_ticket_backtest(picks,t) for t in (2,5,10)}
+ return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'ticket_backtests':ticket_tests,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 walk-forward. ticket_backtests simuleaza cate un bilet pe zi pentru tintele 2/5/10, miza fixa 1, fara a forta zilele fara combinatie apropiata de tinta. Cotele derivate raman proxy de diagnostic.'}
 @router.get('/api/backtest')
 def offline_backtest(days:int=Query(90,ge=1,le=365),per_day:int=Query(100,ge=1,le=100)):return run_backtest(days)
