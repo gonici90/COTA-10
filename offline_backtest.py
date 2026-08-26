@@ -68,8 +68,13 @@ def _rel(db,league,market,p):
  lm=list(db[(league,market)]);gm=list(db[('*',market)]);sample=lm if len(lm)>=12 else gm
  if len(sample)<10:return p,0,len(sample)
  wins=sum(x[0] for x in sample);avgp=sum(x[1] for x in sample)/len(sample);real=(wins+4)/(len(sample)+8);corr=max(-.12,min(.06,real-avgp));weight=min(.80,len(sample)/45);return max(.05,min(.95,p+corr*weight)),corr*weight,len(sample)
+def _gate(db,league,market):
+ lm=list(db[(league,market)]);gm=list(db[('*',market)]);s=lm if len(lm)>=12 else gm
+ if len(s)<10:return 0.,0.,len(s),0.
+ wins=sum(x[0] for x in s);pr=sum(x[2] for x in s);hit=(wins+3)/(len(s)+6);roi=pr/len(s);conf=min(1.,len(s)/35);score=(hit-.72)*100*.55+roi*100*.45
+ return hit,roi,len(s),score*conf
 def run_backtest(days=90):
- rows=_load();last=max(r['_date'] for r in rows);cut=last-timedelta(days=days-1);hist={k:[] for k in LEAGUES.values()};perf=defaultdict(lambda:deque(maxlen=80));picks=[];considered=0
+ rows=_load();last=max(r['_date'] for r in rows);cut=last-timedelta(days=days-1);hist={k:[] for k in LEAGUES.values()};perf=defaultdict(lambda:deque(maxlen=80));pickperf=defaultdict(lambda:deque(maxlen=60));picks=[];considered=0
  for r in rows:
   lh=hist[r['_league']];hs=_stats(lh,r['HomeTeam'],'home');aws=_stats(lh,r['AwayTeam'],'away')
   if hs and aws and min(hs['n'],aws['n'])>=9 and min(hs['venue_n'],aws['venue_n'])>=4:
@@ -77,23 +82,26 @@ def run_backtest(days=90):
    for m,p0 in raw.items():
     o=odds.get(m)
     if not o or o<=1:continue
-    p,adj,nrel=_rel(perf,r['_league'],m,p0)
+    p,adj,nrel=_rel(perf,r['_league'],m,p0);ghit,groi,gn,gscore=_gate(pickperf,r['_league'],m)
+    penalty=max(0.,-.02-groi)*100 if gn>=10 else 0.;bonus=max(-4.,min(4.,gscore));quality=p*100+bonus-penalty
     if m in actual:
      imp=1/o;cal=max(.05,min(.95,.72*p+.28*imp));ev=(cal*o-1)*100;edge=(p-imp)*100
-     if cal>=.70 and 3.5<=edge<=13 and 3<=ev<=18 and 1.28<=o<=2.80:cand.append((cal*100+min(ev,10)*.25,cal,m,o,ev,'historical',adj,nrel))
+     if cal>=.70 and 3.5<=edge<=13 and 3<=ev<=18 and 1.28<=o<=2.80 and not(gn>=14 and groi<-.08):cand.append((quality+min(ev,10)*.25,cal,m,o,ev,'historical',adj,nrel,groi,gn))
     else:
-     # Derived odds are only a simulation proxy. Keep them separate from historical bookmaker odds.
      cal=p;ev=(cal*o-1)*100;floor=.80 if m in ('1X','X2','12','Over 1.5','Under 3.5') else .76
-     if floor<=cal<=.87 and 1.20<=o<=1.42:cand.append((cal*100,cal,m,o,ev,'derived-model',adj,nrel))
+     if floor<=cal<=.87 and 1.20<=o<=1.42 and not(gn>=14 and groi<-.06):cand.append((quality,cal,m,o,ev,'derived-model',adj,nrel,groi,gn))
    if r['_date']>=cut:
     considered+=1
     if cand:
      cand.sort(reverse=True);best=cand[0]
-     if (len(cand)==1 or best[0]-cand[1][0]>=4.0) and best[1]>=.70:
-      _,p,m,o,ev,src,adj,nrel=best;won=_won(m,r['_hg'],r['_ag']);profit=o-1 if won else -1
-      picks.append({'date':r['_date'].isoformat(),'league':r['_league'],'match':r['HomeTeam']+' - '+r['AwayTeam'],'market':m,'probability':round(p*100,1),'estimated':round(p*100,1),'gap':round(adj*100,1),'reliability_sample':nrel,'odds':round(o,2),'odds_source':src,'ev':round(ev,1),'result':f"{r['_hg']}-{r['_ag']}",'won':won,'profit':round(profit,2)})
+     if (len(cand)==1 or best[0]-cand[1][0]>=3.0) and best[1]>=.70:
+      _,p,m,o,ev,src,adj,nrel,trail_roi,trail_n=best;won=_won(m,r['_hg'],r['_ag']);profit=o-1 if won else -1
+      picks.append({'date':r['_date'].isoformat(),'league':r['_league'],'match':r['HomeTeam']+' - '+r['AwayTeam'],'market':m,'probability':round(p*100,1),'estimated':round(p*100,1),'gap':round(adj*100,1),'reliability_sample':nrel,'trail_roi':round(trail_roi*100,1),'trail_sample':trail_n,'odds':round(o,2),'odds_source':src,'ev':round(ev,1),'result':f"{r['_hg']}-{r['_ag']}",'won':won,'profit':round(profit,2)})
+   # Update only after the current match was scored: strict walk-forward, no future leakage.
    for m,p0 in raw.items():
-    w=int(_won(m,r['_hg'],r['_ag']));perf[(r['_league'],m)].append((w,p0));perf[('*',m)].append((w,p0))
+    w=int(_won(m,r['_hg'],r['_ag']));perf[(r['_league'],m)].append((w,p0));perf[('*',m)].append((w,p0));o=odds.get(m)
+    if o and o>1:
+     pr=o-1 if w else -1;pickperf[(r['_league'],m)].append((w,p0,pr));pickperf[('*',m)].append((w,p0,pr))
   lh.append(r)
  total=_summary(picks);by_league={l:_summary([p for p in picks if p['league']==l]) for l in LEAGUES.values()};markets={}
  for m in sorted({p['market'] for p in picks}):
@@ -101,6 +109,6 @@ def run_backtest(days=90):
  buckets={}
  for name,lo,hi in [('60-69',60,70),('70-79',70,80),('80-89',80,90),('90+',90,101)]:
   bp=[p for p in picks if lo<=p['probability']<hi];s=_summary(bp);est=round(sum(p['probability'] for p in bp)/len(bp),1) if bp else None;corr=round(s['hit_rate']-est,1) if bp else None;s['estimated']=est;s['correction_pp']=corr;s['correction']=corr;buckets[name]=s
- return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 adaptiv, fara look-ahead. Calibrarea liga/piata foloseste numai meciurile anterioare. ROI/profit este simulat la miza fixa 1; pentru 1/X/2 si O/U2.5 foloseste cote istorice CSV, iar pentru pietele fara cote istorice foloseste cote derivate de model si trebuie tratat doar ca diagnostic, nu ROI bookmaker real.'}
+ return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 walk-forward. Fiecare liga/piata este calibrata numai din trecut; selectia foloseste si performanta/ROI trailing a aceleiasi ligi+piete, cu penalizare/blocare pentru segmente persistent negative. Fara look-ahead. Cotele derivate raman doar proxy de diagnostic.'}
 @router.get('/api/backtest')
 def offline_backtest(days:int=Query(90,ge=1,le=365),per_day:int=Query(100,ge=1,le=100)):return run_backtest(days)
