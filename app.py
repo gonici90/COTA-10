@@ -7,7 +7,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="COTA 10 Football Analyzer", version="1.2")
+app = FastAPI(title="COTA 10 Football Analyzer", version="1.3")
 API_KEY = os.getenv("API_FOOTBALL_KEY", "")
 API_BASE = "https://v3.football.api-sports.io"
 
@@ -34,11 +34,16 @@ async def api_get(path: str, params: dict):
     return (await api_get_full(path, params)).get("response", [])
 
 
-async def recent_team_stats(team_id: int, before_day: str, last: int = 8):
-    # Free API-Football plans reject the `last` parameter. Fetch a bounded
-    # historical date range instead and keep the newest completed fixtures.
-    year = int(before_day[:4])
-    games = await api_get("/fixtures", {"team": team_id, "from": f"{year-1}-01-01", "to": before_day})
+async def recent_team_stats(team_id: int, league_id: int, season: int, before_day: str, last: int = 8):
+    # Free API-Football requires season for team fixture history and does not
+    # allow the `last` parameter. Restrict by league+season and trim locally.
+    games = await api_get("/fixtures", {
+        "team": team_id,
+        "league": league_id,
+        "season": season,
+        "from": f"{season}-01-01",
+        "to": before_day,
+    })
     completed = []
     for g in games:
         goals = g.get("goals", {})
@@ -67,15 +72,18 @@ async def recent_team_stats(team_id: int, before_day: str, last: int = 8):
 async def analyze_fixture(f, day: str):
     home = f["teams"]["home"]
     away = f["teams"]["away"]
-    hs = await recent_team_stats(home["id"], day)
-    aws = await recent_team_stats(away["id"], day)
+    league = f.get("league", {})
+    league_id = league.get("id")
+    season = league.get("season") or int(day[:4])
+    hs = await recent_team_stats(home["id"], league_id, season, day)
+    aws = await recent_team_stats(away["id"], league_id, season, day)
     home_xg = (hs["gf"] + aws["ga"]) / 2
     away_xg = (aws["gf"] + hs["ga"]) / 2
     expected = max(0.4, min(5.5, home_xg + away_xg))
     poisson = poisson_over_25(expected)
     form_rate = (hs["over25_rate"] + aws["over25_rate"]) / 2
     probability = max(0.05, min(0.95, 0.70 * poisson + 0.30 * form_rate))
-    return {"fixture_id": f["fixture"]["id"], "kickoff": f["fixture"]["date"], "league": f["league"]["name"], "country": f["league"]["country"], "home": home["name"], "away": away["name"], "expected_goals": round(expected, 2), "over25_probability": round(probability * 100, 1), "fair_odds": round(1 / probability, 2), "home_last": hs["played"], "away_last": aws["played"]}
+    return {"fixture_id": f["fixture"]["id"], "kickoff": f["fixture"]["date"], "league": league["name"], "country": league["country"], "home": home["name"], "away": away["name"], "expected_goals": round(expected, 2), "over25_probability": round(probability * 100, 1), "fair_odds": round(1 / probability, 2), "home_last": hs["played"], "away_last": aws["played"]}
 
 
 def build_target_combo(matches, target=10.0):
@@ -94,22 +102,30 @@ def build_target_combo(matches, target=10.0):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "api_key_configured": bool(API_KEY), "version": "1.2"}
+    return {"status": "ok", "api_key_configured": bool(API_KEY), "version": "1.3"}
 
 
 @app.get("/api/analyze")
-async def analyze(day: str = Query(default_factory=lambda: date.today().isoformat()), limit: int = 25, target: float = 10.0):
+async def analyze(day: str = Query(default_factory=lambda: date.today().isoformat()), limit: int = 8, target: float = 10.0):
     raw = await api_get_full("/fixtures", {"date": day})
     fixtures = raw.get("response", [])
     status_counts = {}
     for f in fixtures:
         s = f.get("fixture", {}).get("status", {}).get("short", "UNKNOWN")
         status_counts[s] = status_counts.get(s, 0) + 1
-    upcoming = [f for f in fixtures if f.get("fixture", {}).get("status", {}).get("short") in {"NS", "TBD", "PST"}][:max(1, min(limit, 40))]
+    # Keep the free-plan request count under control: 1 fixtures request plus
+    # two history requests per analyzed match. Default to 8 candidates.
+    upcoming = [f for f in fixtures if f.get("fixture", {}).get("status", {}).get("short") in {"NS", "TBD", "PST"}][:max(1, min(limit, 8))]
     results, errors = [], []
     for f in upcoming:
-        try: results.append(await analyze_fixture(f, day))
-        except Exception as exc: errors.append({"fixture": f"{f.get('teams',{}).get('home',{}).get('name','?')} - {f.get('teams',{}).get('away',{}).get('name','?')}", "error": str(exc)[:250]})
+        try:
+            results.append(await analyze_fixture(f, day))
+        except Exception as exc:
+            errors.append({"fixture": f"{f.get('teams',{}).get('home',{}).get('name','?')} - {f.get('teams',{}).get('away',{}).get('name','?')}", "error": str(exc)[:250]})
+            # A rate-limit response means further calls in this run will also
+            # fail, so stop instead of burning more quota.
+            if "429" in str(exc) or "rateLimit" in str(exc):
+                break
     results.sort(key=lambda x: x["over25_probability"], reverse=True)
     return {"date": day, "market": "Over 2.5 goals", "api_fixtures": len(fixtures), "status_counts": status_counts, "eligible": len(upcoming), "analyzed": len(results), "analysis_errors": errors[:10], "api_paging": raw.get("paging", {}), "target": target, "ranking": results, "suggested_combo": build_target_combo(results, target)}
 
