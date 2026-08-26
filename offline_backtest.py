@@ -77,7 +77,7 @@ def _won(m,h,a):
 
 def run_backtest(days=90):
     rows=_load()
-    if not rows:return {'tested':0,'wins':0,'losses':0,'hit_rate':0,'roi':0,'profit':0}
+    if not rows:return {'tested':0,'wins':0,'losses':0,'hit_rate':0,'roi':0,'profit':0,'avg_odds':0}
     last_date=rows[-1]['_date']; cutoff=last_date-timedelta(days=days-1)
     picks=[]; history=[]; considered=0
     for r in rows:
@@ -104,23 +104,26 @@ def run_backtest(days=90):
             picks.append({'date':r['_date'].isoformat(),'match':r['HomeTeam']+' - '+r['AwayTeam'],'market':m,'probability':round(p*100,1),'odds':round(o,2),'ev':round(ev,1),'result':f"{r['_hg']}-{r['_ag']}",'won':won,'profit':round(profit,2)})
         history.append(r)
     wins=sum(p['won'] for p in picks); profit=sum(p['profit'] for p in picks); n=len(picks)
+    avg_odds=round(sum(p['odds'] for p in picks)/n,2) if n else 0
     markets={}
     for p in picks:
-        s=markets.setdefault(p['market'],{'n':0,'wins':0,'prob_sum':0.0,'profit':0.0})
-        s['n']+=1; s['wins']+=int(p['won']); s['prob_sum']+=p['probability']; s['profit']+=p['profit']
+        s=markets.setdefault(p['market'],{'n':0,'wins':0,'prob_sum':0.0,'odds_sum':0.0,'profit':0.0})
+        s['n']+=1; s['wins']+=int(p['won']); s['prob_sum']+=p['probability']; s['odds_sum']+=p['odds']; s['profit']+=p['profit']
     for s in markets.values():
         s['hit_rate']=round(100*s['wins']/s['n'],1)
         s['avg_predicted']=round(s['prob_sum']/s['n'],1)
         s['calibration_gap']=round(s['avg_predicted']-s['hit_rate'],1)
+        s['avg_odds']=round(s['odds_sum']/s['n'],2)
         s['profit']=round(s['profit'],2); s['roi']=round(100*s['profit']/s['n'],1)
-        del s['prob_sum']
+        del s['prob_sum']; del s['odds_sum']
     bucket_defs=(('60-69',60,70,65),('70-79',70,80,75),('80-89',80,90,85),('90+',90,101,95))
     calibration={}
     for name,lo,hi,mid in bucket_defs:
         bp=[p for p in picks if lo <= p['probability'] < hi]
         bn=len(bp); bw=sum(int(p['won']) for p in bp); real=round(100*bw/bn,1) if bn else 0
-        calibration[name]={'n':bn,'wins':bw,'hit_rate':real,'expected_mid':mid,'correction_pp':round(real-mid,1) if bn else 0}
-    return {'days':days,'dataset_end':last_date.isoformat(),'tested':n,'wins':wins,'losses':n-wins,'hit_rate':round(100*wins/n,1) if n else 0,'profit':round(profit,2),'roi':round(100*profit/n,1) if n else 0,'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'days_with_matches':len({r['_date'] for r in rows if r['_date']>=cutoff}),'days_with_errors':0,'fixtures_found':sum(1 for r in rows if r['_date']>=cutoff),'finished_considered':considered,'fixtures_analyzed':considered,'analysis_errors':0,'rate_limit_days':0,'selection_rate':round(100*n/considered,1) if considered else 0},'markets':markets,'calibration':calibration,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE pe CSV. Fara API/rate-limit. Cotele istorice B365/Avg sunt folosite la selectie si ROI; miza fixa 1 unitate/selectie.'}
+        correction=round(real-mid,1) if bn else None
+        calibration[name]={'n':bn,'wins':bw,'hit_rate':real,'expected_mid':mid,'correction':correction,'correction_pp':correction}
+    return {'days':days,'dataset_end':last_date.isoformat(),'tested':n,'wins':wins,'losses':n-wins,'hit_rate':round(100*wins/n,1) if n else 0,'profit':round(profit,2),'roi':round(100*profit/n,1) if n else 0,'avg_odds':avg_odds,'stake_per_pick':1,'total_staked':n,'coverage':{'days_requested':days,'days_fetched':days,'days_with_matches':len({r['_date'] for r in rows if r['_date']>=cutoff}),'days_with_errors':0,'fixtures_found':sum(1 for r in rows if r['_date']>=cutoff),'finished_considered':considered,'fixtures_analyzed':considered,'analysis_errors':0,'rate_limit_days':0,'selection_rate':round(100*n/considered,1) if considered else 0},'markets':markets,'calibration':calibration,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE pe CSV. Fara API/rate-limit. Cotele istorice B365/Avg sunt folosite la selectie si ROI; miza fixa 1 unitate/selectie.'}
 
 @router.get('/api/backtest')
 def offline_backtest(days:int=Query(7,ge=1,le=365),per_day:int=Query(20,ge=1,le=100)):
