@@ -75,9 +75,9 @@ def _gate(db,league,market):
  wins=sum(x[0] for x in s);pr=sum(x[2] for x in s);hit=(wins+3)/(len(s)+6);roi=pr/len(s);conf=min(1.,len(s)/35);score=(hit-.72)*100*.55+roi*100*.45
  return hit,roi,len(s),score*conf
 def _ticket_for_day(day_picks,target):
- # One selection per match already exists in day_picks. Find the safest combo close to target.
  pool=sorted(day_picks,key=lambda p:(p['probability'],p.get('ev',0)),reverse=True)[:16];best=None
- for z in range(1,min(8,len(pool))+1):
+ max_legs=3 if target<=2 else 5 if target<=5 else 7
+ for z in range(1,min(max_legs,len(pool))+1):
   for c in combinations(pool,z):
    odd=math.prod(p['odds'] for p in c)
    if odd<target*.80 or odd>target*1.30:continue
@@ -133,6 +133,6 @@ def run_backtest(days=90):
  for name,lo,hi in [('60-69',60,70),('70-79',70,80),('80-89',80,90),('90+',90,101)]:
   bp=[p for p in picks if lo<=p['probability']<hi];s=_summary(bp);est=round(sum(p['probability'] for p in bp)/len(bp),1) if bp else None;corr=round(s['hit_rate']-est,1) if bp else None;s['estimated']=est;s['correction_pp']=corr;s['correction']=corr;buckets[name]=s
  ticket_tests={str(t):_ticket_backtest(picks,t) for t in (2,5,10)}
- return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'ticket_backtests':ticket_tests,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 walk-forward. ticket_backtests simuleaza cate un bilet pe zi pentru tintele 2/5/10, miza fixa 1, fara a forta zilele fara combinatie apropiata de tinta. Cotele derivate raman proxy de diagnostic.'}
+ return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'ticket_backtests':ticket_tests,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 walk-forward. Biletele COTA 2/5/10 au maximum 3/5/7 selectii. Miza fixa 1; zilele fara combinatie apropiata de tinta sunt sarite, fara fortare. Cotele derivate raman proxy de diagnostic.'}
 @router.get('/api/backtest')
 def offline_backtest(days:int=Query(90,ge=1,le=365),per_day:int=Query(100,ge=1,le=100)):return run_backtest(days)
