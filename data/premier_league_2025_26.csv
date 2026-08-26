@@ -1,1 +1,2 @@
-Div,Date,Time,HomeTeam,AwayTeam,FTHG,FTAG,FTR,HTHG,HTAG,HTR,HS,AS,HST,AST,HF,AF,HC,AC,HY,AY,HR,AR,B365H,B365D,B365A,B365>2.5,B365<2.5,AvgH,AvgD,AvgA,Avg>2.5,Avg<2.5,MaxH,MaxD,MaxA,Max>2.5,Max<2.5,AvgC>2.5,AvgC<2.5,B365CH,B365CD,B365CA
+Div,Date,Time,HomeTeam,AwayTeam,FTHG,FTAG,FTR
+E0,15/08/2025,20:00,Liverpool,Bournemouth,4,2,H
