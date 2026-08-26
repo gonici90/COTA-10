@@ -106,10 +106,21 @@ def run_backtest(days=90):
     wins=sum(p['won'] for p in picks); profit=sum(p['profit'] for p in picks); n=len(picks)
     markets={}
     for p in picks:
-        s=markets.setdefault(p['market'],{'n':0,'wins':0,'profit':0.0});s['n']+=1;s['wins']+=int(p['won']);s['profit']+=p['profit']
+        s=markets.setdefault(p['market'],{'n':0,'wins':0,'prob_sum':0.0,'profit':0.0})
+        s['n']+=1; s['wins']+=int(p['won']); s['prob_sum']+=p['probability']; s['profit']+=p['profit']
     for s in markets.values():
-        s['hit_rate']=round(100*s['wins']/s['n'],1);s['profit']=round(s['profit'],2);s['roi']=round(100*s['profit']/s['n'],1)
-    return {'days':days,'dataset_end':last_date.isoformat(),'tested':n,'wins':wins,'losses':n-wins,'hit_rate':round(100*wins/n,1) if n else 0,'profit':round(profit,2),'roi':round(100*profit/n,1) if n else 0,'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'days_with_matches':len({r['_date'] for r in rows if r['_date']>=cutoff}),'days_with_errors':0,'fixtures_found':sum(1 for r in rows if r['_date']>=cutoff),'finished_considered':considered,'fixtures_analyzed':considered,'analysis_errors':0,'rate_limit_days':0,'selection_rate':round(100*n/considered,1) if considered else 0},'markets':markets,'calibration':{},'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE pe CSV. Fara API/rate-limit. Cotele istorice B365/Avg sunt folosite la selectie si ROI; miza fixa 1 unitate/selectie.'}
+        s['hit_rate']=round(100*s['wins']/s['n'],1)
+        s['avg_predicted']=round(s['prob_sum']/s['n'],1)
+        s['calibration_gap']=round(s['avg_predicted']-s['hit_rate'],1)
+        s['profit']=round(s['profit'],2); s['roi']=round(100*s['profit']/s['n'],1)
+        del s['prob_sum']
+    bucket_defs=(('60-69',60,70,65),('70-79',70,80,75),('80-89',80,90,85),('90+',90,101,95))
+    calibration={}
+    for name,lo,hi,mid in bucket_defs:
+        bp=[p for p in picks if lo <= p['probability'] < hi]
+        bn=len(bp); bw=sum(int(p['won']) for p in bp); real=round(100*bw/bn,1) if bn else 0
+        calibration[name]={'n':bn,'wins':bw,'hit_rate':real,'expected_mid':mid,'correction_pp':round(real-mid,1) if bn else 0}
+    return {'days':days,'dataset_end':last_date.isoformat(),'tested':n,'wins':wins,'losses':n-wins,'hit_rate':round(100*wins/n,1) if n else 0,'profit':round(profit,2),'roi':round(100*profit/n,1) if n else 0,'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'days_with_matches':len({r['_date'] for r in rows if r['_date']>=cutoff}),'days_with_errors':0,'fixtures_found':sum(1 for r in rows if r['_date']>=cutoff),'finished_considered':considered,'fixtures_analyzed':considered,'analysis_errors':0,'rate_limit_days':0,'selection_rate':round(100*n/considered,1) if considered else 0},'markets':markets,'calibration':calibration,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE pe CSV. Fara API/rate-limit. Cotele istorice B365/Avg sunt folosite la selectie si ROI; miza fixa 1 unitate/selectie.'}
 
 @router.get('/api/backtest')
 def offline_backtest(days:int=Query(7,ge=1,le=365),per_day:int=Query(20,ge=1,le=100)):
