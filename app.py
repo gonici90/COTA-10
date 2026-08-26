@@ -1,5 +1,7 @@
 import math
 import os
+import json
+from pathlib import Path
 from datetime import date, timedelta
 from itertools import combinations
 import httpx
@@ -9,17 +11,35 @@ from fastapi.responses import HTMLResponse
 app=FastAPI(title='COTA 10 Football Analyzer',version='5.2')
 API_KEY=os.getenv('FOOTBALLDATA_API_KEY') or os.getenv('API_FOOTBALL_KEY','');API_BASE='https://footballdata.io/api/v1'
 MIN_COMBO_PROBABILITY=60.;MIN_RECOMMENDATION_PROBABILITY=60.;MIN_VALUE_EV=3.;MAX_MODEL_BOOK_GAP=.18;MAX_ACCEPTED_EV=45.
+CACHE_DIR=Path(os.getenv('COTA_CACHE_DIR','/tmp/cota10-cache'));CACHE_DIR.mkdir(parents=True,exist_ok=True)
 def pois(k,l):return math.exp(-l)*l**k/math.factorial(k)
 def market_probabilities(hl,al):
  g=[[pois(h,hl)*pois(a,al) for a in range(11)] for h in range(11)];z=sum(map(sum,g)) or 1;home=sum(g[h][a] for h in range(11) for a in range(11) if h>a)/z;draw=sum(g[h][h] for h in range(11))/z;away=sum(g[h][a] for h in range(11) for a in range(11) if h<a)/z;b=(1-math.exp(-hl))*(1-math.exp(-al));t=hl+al;m={'1':home,'X':draw,'2':away,'1X':home+draw,'X2':away+draw,'12':home+away,'GG':b,'NG':1-b}
  for n in (1,2,3):u=sum(pois(k,t) for k in range(n+1));m[f'Over {n}.5']=1-u;m[f'Under {n}.5']=u
  return m
+def _cache_file(path,params):
+ key=json.dumps([path,sorted((params or {}).items())],ensure_ascii=True,separators=(',',':'))
+ import hashlib
+ return CACHE_DIR/(hashlib.sha256(key.encode()).hexdigest()+'.json')
+def _cacheable(path):
+ return path.startswith('/matches/date/') or (path=='/matches')
 async def api_get(path,params=None):
  if not API_KEY:raise HTTPException(500,'FOOTBALLDATA_API_KEY is not configured on Render')
- async with httpx.AsyncClient(timeout=25) as c:r=await c.get(API_BASE+path,params=params or {},headers={'Authorization':f'Bearer {API_KEY}'})
+ params=params or {};cf=_cache_file(path,params) if _cacheable(path) else None
+ if cf and cf.exists():
+  try:return json.loads(cf.read_text(encoding='utf-8'))
+  except Exception:pass
+ async with httpx.AsyncClient(timeout=25) as c:r=await c.get(API_BASE+path,params=params,headers={'Authorization':f'Bearer {API_KEY}'})
+ if r.status_code==429:raise HTTPException(429,f'Footballdata.io rate limit exceeded: {r.text[:300]}')
  if r.status_code!=200:raise HTTPException(502,f'Footballdata.io returned HTTP {r.status_code}: {r.text[:300]}')
  d=r.json()
- if d.get('success') is False:raise HTTPException(502,f"Footballdata.io error: {d.get('error',d)}")
+ if d.get('success') is False:
+  err=d.get('error',d);txt=str(err)
+  if 'rate_limit' in txt.lower():raise HTTPException(429,f'Footballdata.io rate limit exceeded: {txt[:300]}')
+  raise HTTPException(502,f'Footballdata.io error: {err}')
+ if cf:
+  try:cf.write_text(json.dumps(d,ensure_ascii=False),encoding='utf-8')
+  except Exception:pass
  return d
 def extract_matches(d):
  p=d.get('data',[])
@@ -127,7 +147,10 @@ async def backtest(days:int=Query(7,ge=1,le=90),per_day:int=Query(5,ge=1,le=20))
  for off in range(days,0,-1):
   d=(today-timedelta(days=off)).isoformat()
   try:fs=extract_matches(await api_get(f'/matches/date/{d}',{'limit':100}));coverage['days_fetched']+=1;coverage['fixtures_found']+=len(fs);coverage['days_with_matches']+=int(bool(fs))
-  except Exception as e:coverage['days_with_errors']+=1;errs.append({'date':d,'error':str(e)[:160]});continue
+  except Exception as e:
+   coverage['days_with_errors']+=1;msg=str(e);errs.append({'date':d,'error':msg[:160]})
+   if getattr(e,'status_code',None)==429 or '429' in msg or 'rate limit' in msg.lower():coverage['rate_limit_days']+=1;break
+   continue
   finished=[x for x in fs if None not in score_values(x)][:per_day];coverage['finished_considered']+=len(finished);rate_limited=False
   for f in finished:
    try:
