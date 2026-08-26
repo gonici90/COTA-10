@@ -25,21 +25,21 @@ def _probs(hl,al):
  h=sum(g[i][j] for i in range(11) for j in range(11) if i>j)/z;x=sum(g[i][i] for i in range(11))/z;a=sum(g[i][j] for i in range(11) for j in range(11) if i<j)/z;t=hl+al
  under=lambda line:sum(_pois(k,t) for k in range(int(math.floor(line))+1));btts_no=math.exp(-hl)+math.exp(-al)-math.exp(-(hl+al))
  return {'1':h,'X':x,'2':a,'1X':h+x,'X2':x+a,'12':h+a,'Over 1.5':1-under(1.5),'Under 1.5':under(1.5),'Over 2.5':1-under(2.5),'Under 2.5':under(2.5),'Over 3.5':1-under(3.5),'Under 3.5':under(3.5),'BTTS Da':1-btts_no,'BTTS Nu':btts_no}
-def _stats(hist,team,venue,last=10):
+def _stats(hist,team,venue,last=12):
  gs=[];vg=[]
  for r in reversed(hist):
   if team not in (r['HomeTeam'],r['AwayTeam']):continue
   home=r['HomeTeam']==team;gf,ga=(r['_hg'],r['_ag']) if home else (r['_ag'],r['_hg']);gs.append((gf,ga))
   if (venue=='home' and home) or (venue=='away' and not home):vg.append((gf,ga))
-  if len(gs)>=last and len(vg)>=5:break
+  if len(gs)>=last and len(vg)>=6:break
  def av(xs):
   if not xs:return None
   sw=gf=ga=0.
-  for i,(aa,b) in enumerate(xs):w=.88**i;sw+=w;gf+=aa*w;ga+=b*w
+  for i,(aa,b) in enumerate(xs):w=.90**i;sw+=w;gf+=aa*w;ga+=b*w
   return gf/sw,ga/sw,len(xs)
- o,v=av(gs[:last]),av(vg[:5])
+ o,v=av(gs[:last]),av(vg[:6])
  if not o:return None
- return {'gf':.65*o[0]+.35*v[0] if v else o[0],'ga':.65*o[1]+.35*v[1] if v else o[1],'n':o[2]}
+ return {'gf':.65*o[0]+.35*v[0] if v else o[0],'ga':.65*o[1]+.35*v[1] if v else o[1],'n':o[2],'venue_n':v[2] if v else 0}
 def _base_odds(r):return {'1':_f(r,'B365H') or _f(r,'AvgH'),'X':_f(r,'B365D') or _f(r,'AvgD'),'2':_f(r,'B365A') or _f(r,'AvgA'),'Over 2.5':_f(r,'B365>2.5') or _f(r,'Avg>2.5'),'Under 2.5':_f(r,'B365<2.5') or _f(r,'Avg<2.5')}
 def _odds(r,probs):
  o=_base_odds(r);h,x,a=o.get('1'),o.get('X'),o.get('2')
@@ -69,31 +69,28 @@ def run_backtest(days=90):
   lh=hist[r['_league']]
   if r['_date']<cut:lh.append(r);continue
   hs=_stats(lh,r['HomeTeam'],'home');aws=_stats(lh,r['AwayTeam'],'away')
-  if not hs or not aws or min(hs['n'],aws['n'])<7:lh.append(r);continue
+  if not hs or not aws or min(hs['n'],aws['n'])<9 or min(hs['venue_n'],aws['venue_n'])<4:lh.append(r);continue
   considered+=1;hl=max(.15,((hs['gf']+aws['ga'])/2)*1.07);al=max(.15,((aws['gf']+hs['ga'])/2)*.96);probs=_probs(hl,al);odds=_odds(r,probs);cand=[]
   actual={'1','X','2','Over 2.5','Under 2.5'}
   for m,p in probs.items():
    o=odds.get(m)
    if not o or o<=1:continue
    if m in actual:
-    imp=1/o;cal=max(.05,min(.95,.70*p+.30*imp));ev=(cal*o-1)*100;edge=(p-imp)*100
-    # NO BET strict: confidence, positive edge and sensible odds must all agree.
-    if cal>=.67 and 2.5<=edge<=15 and 2<=ev<=22 and 1.25<=o<=3.20:cand.append((cal*100+min(ev,12)*.25,cal,m,o,ev,'istorica'))
+    imp=1/o;cal=max(.05,min(.95,.72*p+.28*imp));ev=(cal*o-1)*100;edge=(p-imp)*100
+    if cal>=.70 and 3.5<=edge<=13 and 3<=ev<=18 and 1.28<=o<=2.80:cand.append((cal*100+min(ev,10)*.25,cal,m,o,ev,'istorica'))
    else:
     cal=max(.05,min(.95,p));ev=0
-    # Without historical market odds we demand a much stronger model signal.
-    floor=.76 if m in ('1X','X2','12','Over 1.5','Under 3.5') else .72
-    if floor<=cal<=.86 and 1.20<=o<=1.55:cand.append((cal*100,cal,m,o,ev,'fair-model'))
+    floor=.80 if m in ('1X','X2','12','Over 1.5','Under 3.5') else .76
+    if floor<=cal<=.86 and 1.20<=o<=1.42:cand.append((cal*100,cal,m,o,ev,'fair-model'))
   if cand:
    cand.sort(reverse=True);best=cand[0]
-   # Require separation from runner-up so marginal/ambiguous matches become NO BET.
-   if len(cand)==1 or best[0]-cand[1][0]>=2.0:
+   if (len(cand)==1 or best[0]-cand[1][0]>=4.0) and best[1]>=.70:
     _,p,m,o,ev,src=best;won=_won(m,r['_hg'],r['_ag']);profit=(o-1 if won else -1) if src!='fair-model' else 0
     picks.append({'date':r['_date'].isoformat(),'league':r['_league'],'match':r['HomeTeam']+' - '+r['AwayTeam'],'market':m,'probability':round(p*100,1),'odds':round(o,2),'odds_source':src,'ev':round(ev,1),'result':f"{r['_hg']}-{r['_ag']}",'won':won,'profit':round(profit,2)})
   lh.append(r)
  total=_summary(picks);by_league={l:_summary([p for p in picks if p['league']==l]) for l in LEAGUES.values()};markets={m:_summary([p for p in picks if p['market']==m]) for m in sorted({p['market'] for p in picks})};buckets={}
  for name,lo,hi,mid in [('60-69',60,70,65),('70-79',70,80,75),('80-89',80,90,85),('90+',90,101,95)]:
-  bp=[p for p in picks if lo<=p['probability']<hi];s=_summary(bp);s['correction_pp']=round(s['hit_rate']-mid,1) if s['n'] else None;buckets[name]=s
- return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 cu NO BET strict. Algoritmul cere istoric minim, incredere, edge/EV si separare fata de a doua optiune. ROI/profit se calculeaza numai pentru pietele cu cote istorice/derivate, nu pentru fair-model.'}
+  bp=[p for p in picks if lo<=p['probability']<hi];s=_summary(bp);corr=round(s['hit_rate']-mid,1) if s['n'] else None;s['correction_pp']=corr;s['correction']=corr;buckets[name]=s
+ return {'days':days,'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':{'days_requested':days,'days_fetched':days,'fixtures_found':sum(1 for r in rows if r['_date']>=cut),'finished_considered':considered,'fixtures_analyzed':considered,'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0},'leagues':by_league,'markets':markets,'calibration':buckets,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 cu NO BET foarte selectiv: istoric si venue sample mai mari, praguri ridicate, edge/EV controlat si separare clara fata de a doua optiune. ROI/profit doar pe piete cu cote istorice/derivate.'}
 @router.get('/api/backtest')
 def offline_backtest(days:int=Query(90,ge=1,le=365),per_day:int=Query(100,ge=1,le=100)):return run_backtest(days)
