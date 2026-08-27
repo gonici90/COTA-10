@@ -4,6 +4,7 @@ from datetime import datetime,timedelta
 from itertools import combinations
 from pathlib import Path
 from fastapi import APIRouter,HTTPException,Query
+from ml_engine import WalkForwardLearner
 router=APIRouter()
 LEAGUES={'premier_league_2025_26.csv':'Premier League','SP1.csv':'La Liga','I1.csv':'Serie A','D1.csv':'Bundesliga','F1.csv':'Ligue 1'}
 def _f(r,k):
@@ -118,31 +119,32 @@ def _ticket_backtest(picks,target):
  n=len(tickets);w=sum(t['won'] for t in tickets);profit=sum(t['profit'] for t in tickets)
  return {'target':target,'tickets':n,'wins':w,'losses':n-w,'hit_rate':round(100*w/n,1) if n else 0,'profit':round(profit,2),'roi':round(100*profit/n,1) if n else 0,'avg_odds':round(sum(t['odds'] for t in tickets)/n,2) if n else 0,'bankroll_curve':curve,'recent_tickets':tickets[-20:][::-1]}
 def run_backtest(days=90):
- rows=_load();first=min(r['_date'] for r in rows);last=max(r['_date'] for r in rows);cut=last-timedelta(days=days-1);window=[r for r in rows if r['_date']>=cut];available_dates=sorted({r['_date'] for r in window});hist={k:[] for k in LEAGUES.values()};perf=defaultdict(lambda:deque(maxlen=80));pickperf=defaultdict(lambda:deque(maxlen=60));bandperf=defaultdict(lambda:deque(maxlen=60));picks=[];considered=0
+ rows=_load();first=min(r['_date'] for r in rows);last=max(r['_date'] for r in rows);cut=last-timedelta(days=days-1);window=[r for r in rows if r['_date']>=cut];available_dates=sorted({r['_date'] for r in window});hist={k:[] for k in LEAGUES.values()};perf=defaultdict(lambda:deque(maxlen=80));pickperf=defaultdict(lambda:deque(maxlen=60));bandperf=defaultdict(lambda:deque(maxlen=60));learner=WalkForwardLearner();picks=[];considered=0
  for r in rows:
   lh=hist[r['_league']];hs=_stats(lh,r['HomeTeam'],'home');aws=_stats(lh,r['AwayTeam'],'away')
   if hs and aws and min(hs['n'],aws['n'])>=9 and min(hs['venue_n'],aws['venue_n'])>=4:
-   hl=max(.15,((hs['gf']+aws['ga'])/2)*1.07);al=max(.15,((aws['gf']+hs['ga'])/2)*.96);raw=_probs(hl,al);odds=_odds(r,raw);cand=[];actual={'1','X','2','Over 2.5','Under 2.5'}
+   hl=max(.15,((hs['gf']+aws['ga'])/2)*1.07);al=max(.15,((aws['gf']+hs['ga'])/2)*.96);raw=_probs(hl,al);odds=_odds(r,raw);cand=[];train_x={};actual={'1','X','2','Over 2.5','Under 2.5'}
    for m,p0 in raw.items():
     o=odds.get(m)
     if not o or o<=1:continue
-    p,adj,nrel=_rel(perf,r['_league'],m,p0);ghit,groi,gn,gscore=_gate(pickperf,r['_league'],m);bhit,broi,bn,bscore=_band_gate(bandperf,r['_league'],m,o)
+    p_old,adj,nrel=_rel(perf,r['_league'],m,p0);x=learner.features(p_old,o,r['_league'],m,hs,aws);p,maturity=learner.predict(m,x,p_old);train_x[m]=x;ghit,groi,gn,gscore=_gate(pickperf,r['_league'],m);bhit,broi,bn,bscore=_band_gate(bandperf,r['_league'],m,o)
     penalty=max(0.,-.02-groi)*100 if gn>=10 else 0.;bonus=max(-4.,min(4.,gscore));band_bonus=max(-3.,min(3.,bscore));quality=p*100+bonus+band_bonus-penalty
     if m in actual:
      imp=1/o;cal=max(.05,min(.95,.72*p+.28*imp));ev=(cal*o-1)*100;edge=(p-imp)*100
-     if cal>=.62 and 2.5<=edge<=15 and 1<=ev<=22 and 1.28<=o<=2.80 and not(gn>=14 and groi<-.08) and not(bn>=10 and broi<-.08):cand.append((quality+min(ev,10)*.25,cal,m,o,ev,'historical',adj,nrel,groi,gn,broi,bn,bscore))
+     if cal>=.62 and 2.5<=edge<=15 and 1<=ev<=22 and 1.28<=o<=2.80 and not(gn>=14 and groi<-.08) and not(bn>=10 and broi<-.08):cand.append((quality+min(ev,10)*.25,cal,m,o,ev,'historical+ml',adj,nrel,groi,gn,broi,bn,bscore,maturity,p_old))
     else:
      cal=p;ev=(cal*o-1)*100;floor=.76 if m in ('1X','X2','12','Over 1.5','Under 3.5') else .72
-     if floor<=cal<=.89 and 1.18<=o<=1.55 and not(gn>=14 and groi<-.06) and not(bn>=10 and broi<-.06):cand.append((quality,cal,m,o,ev,'derived-model',adj,nrel,groi,gn,broi,bn,bscore))
+     if floor<=cal<=.89 and 1.18<=o<=1.55 and not(gn>=14 and groi<-.06) and not(bn>=10 and broi<-.06):cand.append((quality,cal,m,o,ev,'derived-model+ml',adj,nrel,groi,gn,broi,bn,bscore,maturity,p_old))
    if r['_date']>=cut:
     considered+=1
     if cand:
      cand.sort(reverse=True);best=cand[0]
      if (len(cand)==1 or best[0]-cand[1][0]>=2.0) and best[1]>=.62:
-      _,p,m,o,ev,src,adj,nrel,trail_roi,trail_n,band_roi,band_n,band_score=best;won=_won(m,r['_hg'],r['_ag']);profit=o-1 if won else -1
-      picks.append({'date':r['_date'].isoformat(),'league':r['_league'],'match':r['HomeTeam']+' - '+r['AwayTeam'],'market':m,'probability':round(p*100,1),'estimated':round(p*100,1),'gap':round(adj*100,1),'reliability_sample':nrel,'trail_roi':round(trail_roi*100,1),'trail_sample':trail_n,'band':_band(o),'band_roi':round(band_roi*100,1),'band_sample':band_n,'band_score':round(band_score,2),'odds':round(o,2),'odds_source':src,'ev':round(ev,1),'result':f"{r['_hg']}-{r['_ag']}",'won':won,'profit':round(profit,2)})
+      _,p,m,o,ev,src,adj,nrel,trail_roi,trail_n,band_roi,band_n,band_score,maturity,p_old=best;won=_won(m,r['_hg'],r['_ag']);profit=o-1 if won else -1
+      picks.append({'date':r['_date'].isoformat(),'league':r['_league'],'match':r['HomeTeam']+' - '+r['AwayTeam'],'market':m,'probability':round(p*100,1),'estimated':round(p*100,1),'old_probability':round(p_old*100,1),'ml_maturity':round(maturity*100,1),'gap':round(adj*100,1),'reliability_sample':nrel,'trail_roi':round(trail_roi*100,1),'trail_sample':trail_n,'band':_band(o),'band_roi':round(band_roi*100,1),'band_sample':band_n,'band_score':round(band_score,2),'odds':round(o,2),'odds_source':src,'ev':round(ev,1),'result':f"{r['_hg']}-{r['_ag']}",'won':won,'profit':round(profit,2)})
    for m,p0 in raw.items():
     w=int(_won(m,r['_hg'],r['_ag']));perf[(r['_league'],m)].append((w,p0));perf[('*',m)].append((w,p0));o=odds.get(m)
+    if m in train_x:learner.learn(m,train_x[m],w)
     if o and o>1:
      pr=o-1 if w else -1;pickperf[(r['_league'],m)].append((w,p0,pr));pickperf[('*',m)].append((w,p0,pr));b=_band(o);bandperf[(r['_league'],m,b)].append((w,p0,pr));bandperf[('*',m,b)].append((w,p0,pr))
   lh.append(r)
@@ -155,6 +157,6 @@ def run_backtest(days=90):
  ticket_tests={str(t):_ticket_backtest(picks,t) for t in (1.5,2,5,10)}
  pick_dates=sorted({p['date'] for p in picks});actual_start=available_dates[0].isoformat() if available_dates else None;actual_end=available_dates[-1].isoformat() if available_dates else None;calendar_span=(available_dates[-1]-available_dates[0]).days+1 if available_dates else 0
  coverage={'days_requested':days,'requested_start':cut.isoformat(),'dataset_start':first.isoformat(),'dataset_end':last.isoformat(),'actual_start':actual_start,'actual_end':actual_end,'calendar_days_covered':calendar_span,'match_days_available':len(available_dates),'fixtures_found':len(window),'finished_considered':considered,'fixtures_analyzed':considered,'selections':total['n'],'days_with_selection':len(pick_dates),'selection_rate':round(100*total['n']/considered,1) if considered else 0,'no_bet':considered-total['n'],'full_requested_window':bool(available_dates and available_dates[0]<=cut),'missing_calendar_days':max(0,days-calendar_span),'days_with_errors':0,'analysis_errors':0,'rate_limit_days':0}
- return {'days':days,'dataset_start':first.isoformat(),'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'coverage':coverage,'leagues':by_league,'markets':markets,'calibration':buckets,'ticket_backtests':ticket_tests,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 walk-forward. Coverage raporteaza intervalul real disponibil in CSV; nu presupune ca days_requested inseamna automat date complete. COTA 1.50/2/5/10; fara look-ahead si fara fortarea biletelor.'}
+ return {'days':days,'dataset_start':first.isoformat(),'dataset_end':last.isoformat(),'leagues_loaded':list(LEAGUES.values()),'dataset_matches':len(rows),'tested':total['n'],'wins':total['wins'],'losses':total['losses'],'hit_rate':total['hit_rate'],'profit':total['profit'],'roi':total['roi'],'avg_odds':total['avg_odds'],'stake_per_pick':1,'ml':{'enabled':True,'mode':'walk-forward online logistic','observations':learner.global_model.n},'coverage':coverage,'leagues':by_league,'markets':markets,'calibration':buckets,'ticket_backtests':ticket_tests,'recent':picks[-30:][::-1],'errors':[],'note':'Backtest OFFLINE Big 5 + ML walk-forward. Predictia este facuta inainte de update-ul cu rezultatul acelui meci; fara look-ahead. COTA 1.50/2/5/10; fara fortarea biletelor.'}
 @router.get('/api/backtest')
 def offline_backtest(days:int=Query(90,ge=1,le=365),per_day:int=Query(100,ge=1,le=100)):return run_backtest(days)
