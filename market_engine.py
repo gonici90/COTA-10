@@ -42,17 +42,10 @@ def _normalize_odds(data):
         return b.get('odds') or b.get('markets') or {}
     return data.get('odds') or data.get('markets') or data
 
-def _odds_payload(fid,inline=None):
-    # /fixtures?include=odds returns Bet365 odds inline. Prefer that so a day costs
-    # 1-2 requests instead of one extra request for every fixture.
-    inline_odds=_normalize_odds(inline) if inline else {}
-    if inline_odds and any(k in inline_odds for k in ('1x2','asian_handicap','asian','goal_line','goalline','corner_line','corner','cards','card_line')):
-        return inline_odds
+def _odds_payload(fid):
     if fid in _ODDS_CACHE:return _ODDS_CACHE[fid]
     raw=fd._get(f'/fixtures/{fid}/odds',{'bookmakers':'bet365'})
-    odds=_normalize_odds(raw)
-    _ODDS_CACHE[fid]=odds
-    return odds
+    odds=_normalize_odds(raw);_ODDS_CACHE[fid]=odds;return odds
 
 def _recent(team_id,before,n=12):
     if not team_id:return []
@@ -63,8 +56,7 @@ def _recent(team_id,before,n=12):
     if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or []
     else:rows=data or []
     rows=[x for x in rows if (x.get('goals') or {}).get('home') is not None];rows.sort(key=lambda x:x.get('kickoff_ts') or 0,reverse=True);rows=rows[:n]
-    _RECENT_CACHE[key]=rows
-    return rows
+    _RECENT_CACHE[key]=rows;return rows
 
 def _team_rates(tid,games):
     gf=ga=cf=ca=yf=ya=ws=0
@@ -82,7 +74,7 @@ def _add(out,name,p,odd,src):
     p=max(.02,min(.98,p));imp=1/odd;cal=max(.03,min(.97,.62*p+.38*imp));ev=(cal*odd-1)*100
     out.append({'market':name,'probability':round(cal*100,1),'raw_probability':round(p*100,1),'bookmaker_odds':round(odd,2),'fair_odds':round(1/cal,2),'ev':round(ev,1),'safe':cal>=.64,'value':ev>=2,'suspicious':abs(p-imp)>.25,'source':src,'recommendation_score':round(cal*100+max(-5,min(10,ev))*.15,1)})
 def analyze_fixture(f):
-    teams=f.get('teams') or {};h=teams.get('home') or {};a=teams.get('away') or {};fid=f.get('id');ts=f.get('kickoff_ts') or int(datetime.now(timezone.utc).timestamp());hr=_team_rates(h.get('id'),_recent(h.get('id'),ts));ar=_team_rates(a.get('id'),_recent(a.get('id'),ts));lh=max(.15,(hr['gf']+ar['ga'])/2*1.06);la=max(.15,(ar['gf']+hr['ga'])/2*.96);hp,dp,ap,g=_score_probs(lh,la);odds=_odds_payload(fid,f);picks=[]
+    teams=f.get('teams') or {};h=teams.get('home') or {};a=teams.get('away') or {};fid=f.get('id');ts=f.get('kickoff_ts') or int(datetime.now(timezone.utc).timestamp());hr=_team_rates(h.get('id'),_recent(h.get('id'),ts));ar=_team_rates(a.get('id'),_recent(a.get('id'),ts));lh=max(.15,(hr['gf']+ar['ga'])/2*1.06);la=max(.15,(ar['gf']+hr['ga'])/2*.96);hp,dp,ap,g=_score_probs(lh,la);odds=_odds_payload(fid);picks=[]
     m=_stage(odds.get('1x2'))
     if m:_add(picks,'1',hp,m.get('home'),'Bet365 1X2');_add(picks,'X',dp,m.get('draw'),'Bet365 1X2');_add(picks,'2',ap,m.get('away'),'Bet365 1X2')
     m=_stage(odds.get('asian_handicap') or odds.get('asian'))
@@ -98,9 +90,10 @@ def analyze_fixture(f):
 
 def _day_fixtures(day):
     start=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp());out=[]
-    # include=odds is explicitly supported by 5Dollar and caps pages at 50.
+    # Pro plan: fixture lists are allowed, but include=odds is not. Fetch fixtures
+    # normally, then read odds one fixture at a time from /fixtures/{id}/odds.
     for page in range(1,10):
-        raw=fd._get('/fixtures',{'start_time':start,'end_time':start+86400,'include':'odds','per_page':50,'page':page})
+        raw=fd._get('/fixtures',{'start_time':start,'end_time':start+86400,'per_page':50,'page':page})
         data=raw.get('data',raw) if isinstance(raw,dict) else raw
         if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or [];pag=data.get('pagination') or {}
         else:rows=data or [];pag={}
