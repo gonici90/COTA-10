@@ -20,20 +20,24 @@ def safer_build_combo(rows,target):
             if not odd or p.get('suspicious'):continue
             odd=float(odd);prob=float(p.get('probability',0))/100
             if high:
-                # COTA 100: reject weak/high-odds legs; prefer many safer selections.
-                minp=.76 if odd<1.20 else .72 if odd<1.30 else .68 if odd<1.40 else .65 if odd<=1.50 else .62
-                allowed=1.05<=odd<=1.60
+                # COTA 100: many moderate legs, but adapt to the number of fixtures
+                # that actually have usable odds. Do not require 14 legs when only
+                # e.g. 13 matches have markets available.
+                minp=.72 if odd<1.25 else .68 if odd<1.35 else .64 if odd<1.45 else .60 if odd<1.55 else .58
+                allowed=1.05<=odd<=1.65
             else:
                 minp=.70 if odd<1.20 else .66 if odd<1.35 else .62 if odd<1.60 else .58
                 allowed=1.04<=odd<=3.50
             if allowed and prob>=minp:
                 good.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'combo_prob':prob})
         if good:
-            # One selection per match. Probability first, then lower odds.
-            candidates.append(max(good,key=lambda x:(x['combo_prob'],-x['bookmaker_odds'],x.get('recommendation_score',0))))
+            # Exactly one leg per match; probability is the primary objective.
+            candidates.append(max(good,key=lambda x:(x['combo_prob'],x.get('recommendation_score',0),-x['bookmaker_odds'])))
 
     def search(max_odd,min_legs,max_legs,lo,hi):
         pool=[x for x in candidates if x['bookmaker_odds']<=max_odd]
+        if len(pool)<min_legs:return None
+        max_legs=min(max_legs,len(pool))
         states={(0,0):(1.0,1.0,[])}
         for x in pool:
             nxt=dict(states)
@@ -42,20 +46,22 @@ def safer_build_combo(rows,target):
                 no=odd*x['bookmaker_odds']
                 if no>target*hi:continue
                 nj=joint*x['combo_prob'];nl=legs+1
-                bucket=round(math.log(max(no,1.0))*160)
+                bucket=round(math.log(max(no,1.0))*180)
                 key=(nl,bucket);old=nxt.get(key)
                 if old is None or nj>old[1]:nxt[key]=(no,nj,path+[x])
             states=nxt
         valid=[v for (legs,_),v in states.items() if min_legs<=legs<=max_legs and target*lo<=v[0]<=target*hi]
         if not valid:return None
-        # Highest joint probability wins; closeness to requested target breaks ties.
         return max(valid,key=lambda v:(v[1],-abs(math.log(v[0]/target)),len(v[2])))
 
     if high:
-        # Never call an 86-odds / 8-leg ticket COTA 100. Try long tickets first.
-        best=(search(1.45,14,20,.95,1.08) or
-              search(1.50,12,20,.95,1.08) or
-              search(1.60,10,20,.95,1.08))
+        # Adapt the minimum number of legs to the usable pool. Prefer 12-20,
+        # then 10+, and only as a last resort 8+; odds per leg remain capped.
+        n=len(candidates)
+        best=None
+        if n>=12:best=search(1.50,12,20,.95,1.08)
+        if best is None and n>=10:best=search(1.55,10,20,.95,1.08)
+        if best is None and n>=8:best=search(1.65,8,20,.95,1.08)
     else:
         best=search(3.50,1,12,.92,1.08)
     if not best:return None
