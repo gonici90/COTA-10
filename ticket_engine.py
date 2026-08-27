@@ -3,8 +3,6 @@ from itertools import combinations
 
 import offline_backtest as ob
 
-# Add the previous Big 5 season as walk-forward history. The 2025/26 files
-# remain the newest data, while 2024/25 gives the model a proper warm-up.
 ob.LEAGUES.update({
     'E0 3.csv': 'Premier League',
     'SP1 2.csv': 'La Liga',
@@ -14,8 +12,12 @@ ob.LEAGUES.update({
 })
 
 
+def _is_historical(p):
+    return str(p.get('odds_source') or '').startswith('historical')
+
+
 def _trusted_source(p):
-    if p.get('odds_source') == 'historical':
+    if _is_historical(p):
         return True
     return p.get('market') in ('1X', 'X2', '12')
 
@@ -25,9 +27,11 @@ def _conservative_prob(p):
     odd = max(1.01, float(p.get('odds', 1.01)))
     implied = 1.0 / odd
     n = max(0, int(p.get('reliability_sample', 0) or 0))
-    model_weight = .50 + min(.20, n / 250.0)
-    if p.get('odds_source') != 'historical':
+    maturity = max(0., min(1., float(p.get('ml_maturity', 0) or 0) / 100.0))
+    model_weight = .48 + min(.17, n / 300.0) + .08 * maturity
+    if not _is_historical(p):
         model_weight -= .10
+    model_weight = max(.38, min(.73, model_weight))
     q = model_weight * model + (1.0 - model_weight) * implied
     tn = int(p.get('trail_sample', 0) or 0)
     tr = float(p.get('trail_roi', 0) or 0) / 100.0
@@ -38,13 +42,13 @@ def _conservative_prob(p):
 
 def ticket_for_day(day_picks, target):
     if target <= 1.5:
-        min_p, max_o, max_legs, min_ev = .72, 1.80, 2, .010
+        min_p, max_o, max_legs, min_ev = .70, 1.80, 2, .005
     elif target <= 2:
-        min_p, max_o, max_legs, min_ev = .68, 2.05, 3, .015
+        min_p, max_o, max_legs, min_ev = .67, 2.05, 3, .010
     elif target <= 5:
-        min_p, max_o, max_legs, min_ev = .61, 2.45, 5, .025
+        min_p, max_o, max_legs, min_ev = .61, 2.45, 5, .020
     else:
-        min_p, max_o, max_legs, min_ev = .57, 2.80, 7, .035
+        min_p, max_o, max_legs, min_ev = .57, 2.80, 7, .030
 
     pool = []
     for p in day_picks:
@@ -85,20 +89,15 @@ def ticket_for_day(day_picks, target):
 ob._ticket_for_day = ticket_for_day
 _original_run_backtest = ob.run_backtest
 
-def run_backtest_with_targets(days=90):
-    result = _original_run_backtest(days)
-    picks = list(reversed(result.get('recent', []))) if False else None
-    return result
-
-def _run(days=90):
-    result = _original_run_backtest(days)
-    return result
-
 try:
     consts = list(_original_run_backtest.__code__.co_consts)
-    idx = consts.index((2, 5, 10))
-    consts[idx] = (1.5, 2, 5, 10)
-    ob.run_backtest.__code__ = ob.run_backtest.__code__.replace(co_consts=tuple(consts))
+    idx = consts.index((1.5, 2, 5, 10))
+except ValueError:
+    try:
+        idx = consts.index((2, 5, 10)); consts[idx] = (1.5, 2, 5, 10)
+        ob.run_backtest.__code__ = ob.run_backtest.__code__.replace(co_consts=tuple(consts))
+    except Exception:
+        pass
 except Exception:
     pass
 
