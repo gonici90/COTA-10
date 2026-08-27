@@ -87,27 +87,49 @@ def analyze_fixture(f):
     return {'fixture_id':fid,'league':(f.get('league') or {}).get('name',''),'country':'','home':h.get('name','?'),'away':a.get('name','?'),'home_xg':round(lh,2),'away_xg':round(la,2),'confidence':'ridicată' if min(hr['n'],ar['n'])>=8 else 'medie','markets':picks,'best_market':best,'best_value':next((x for x in picks if x['value']),None),'home_last':hr['n'],'away_last':ar['n']}
 def _day_fixtures(day):
     start=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp()); end=start+86400
-    # IMPORTANT: Community Access rejects include=odds on the fixtures listing. Odds are fetched per fixture above.
     raw=fd._get('/fixtures',{'start_time':start,'end_time':end,'per_page':50})
     return (raw.get('fixtures') or raw.get('data') or []) if isinstance(raw,dict) else (raw or [])
+
 def build_combo(rows,target):
-    pool=[]
+    """Build target odds from the safest independent matches.
+    Low odds are deliberately allowed: a 1.10-1.30 handicap/goal line can be
+    preferable to forcing one 1.50+ selection. Never use two markets from the
+    same match in one accumulator.
+    """
+    candidates=[]
     for r in rows:
+        match=r['home']+' - '+r['away']
         for p in r.get('markets',[]):
-            if p['safe'] and p['bookmaker_odds']>=1.08:pool.append({**p,'home':r['home'],'away':r['away'],'match':r['home']+' - '+r['away']})
-    pool=sorted(pool,key=lambda x:(x['probability'],x['recommendation_score']),reverse=True)[:30]; best=None
-    for z in range(1,min(5,len(pool))+1):
+            odd=p['bookmaker_odds']; prob=p['probability']/100
+            # Tiered safety: demand more probability from shorter prices.
+            min_prob=.78 if odd<1.20 else .72 if odd<1.35 else .67 if odd<1.60 else .64
+            if 1.07<=odd<=3.25 and prob>=min_prob and not p.get('suspicious'):
+                candidates.append({**p,'home':r['home'],'away':r['away'],'match':match,'combo_prob':prob,'combo_quality':prob-(1/odd)*.10})
+    # Keep only the strongest alternatives per match, otherwise combinations explode.
+    per_match={}
+    for x in sorted(candidates,key=lambda x:(x['combo_quality'],x['probability']),reverse=True):
+        per_match.setdefault(x['match'],[])
+        if len(per_match[x['match']])<2: per_match[x['match']].append(x)
+    pool=[x for xs in per_match.values() for x in xs]
+    pool=sorted(pool,key=lambda x:(x['combo_quality'],x['probability']),reverse=True)[:36]
+    best=None
+    # COTA 5/10 often needs more than five small safe legs. Allow up to 8.
+    max_legs=min(8,len(per_match))
+    for z in range(1,max_legs+1):
         for c in combinations(pool,z):
-            if len({x['match'] for x in c})<len(c):continue
+            if len({x['match'] for x in c})<len(c): continue
             odd=math.prod(x['bookmaker_odds'] for x in c)
-            if not target*.94<=odd<=target*1.10:continue
-            joint=math.prod(x['probability']/100 for x in c); score=joint-abs(math.log(odd/target))*.03
-            if best is None or score>best[0]:best=(score,odd,c)
+            if not target*.92<=odd<=target*1.12: continue
+            joint=math.prod(x['combo_prob'] for x in c)
+            # Probability dominates; closeness to target is only a tie-breaker.
+            score=joint-abs(math.log(odd/target))*.015
+            if best is None or score>best[0]: best=(score,odd,c,joint)
     if not best:return None
-    return {'combined_odds':round(best[1],2),'matches':[{'home':x['home'],'away':x['away'],'selection':x['market'],'probability':x['probability'],'odds':x['bookmaker_odds'],'ev':x['ev'],'score':x['recommendation_score']} for x in best[2]]}
+    return {'combined_odds':round(best[1],2),'estimated_joint_probability':round(best[3]*100,1),'matches':[{'home':x['home'],'away':x['away'],'selection':x['market'],'probability':x['probability'],'odds':x['bookmaker_odds'],'ev':x['ev'],'score':x['recommendation_score']} for x in best[2]]}
 def analyze_day(day,target=10,limit=12):
     fs=[x for x in _day_fixtures(day) if str(x.get('status','')).lower() not in ('finished','cancelled','canceled','postponed')]; rows=[]; errors=[]
-    for f in fs[:max(1,min(int(limit),20))]:
+    # Analyze more fixtures when available so a safe accumulator is not built from only the first few matches.
+    for f in fs[:max(1,min(int(limit),30))]:
         try:
             r=analyze_fixture(f)
             if r['best_market']:rows.append(r)
