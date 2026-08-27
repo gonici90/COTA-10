@@ -1,9 +1,9 @@
 """Small dependency-free online ML layer for COTA-10.
 
-Uses online logistic regression. It is deliberately walk-forward: predict first,
-then learn after the result is known, so historical backtests cannot see future
-results. The learner can be fed every historical market observation and keeps
-separate models by market plus a global model.
+Uses online logistic regression in strict walk-forward mode: predict first, then
+learn after the result is known.  The final probability is deliberately
+conservative because ticket construction needs calibrated probabilities, not
+just a ranking score.
 """
 import math
 from collections import defaultdict
@@ -59,11 +59,21 @@ class WalkForwardLearner:
         gm=self.global_model.predict(x)
         mm=self.market_models[market]
         mp=mm.predict(x)
-        # Cold-start protection: the old calibrated probability dominates until
-        # the learner has accumulated a meaningful amount of prior evidence.
         maturity=min(1.0,(self.global_model.n+mm.n)/1200.0)
         learned=(.35*gm+.65*mp) if mm.n>=40 else gm
-        return max(.03,min(.97,(1-maturity)*fallback+maturity*learned)), maturity
+        raw=(1-maturity)*fallback+maturity*learned
+
+        # Calibration guard.  The previous engine could promote a selection
+        # because the model was merely confident, even when the market prior
+        # disagreed.  Blend toward the implied prior as evidence matures and
+        # subtract a small uncertainty margin.  This intentionally creates
+        # more NO-BET days and should improve hit-rate rather than ticket count.
+        implied=max(.03,min(.97,x.get('implied_p',0.0)/2.0+.5))
+        evidence=min(1.0,(self.global_model.n+mm.n)/1800.0)
+        calibrated=(1-.18*evidence)*raw+(.18*evidence)*implied
+        uncertainty=.020-.008*evidence
+        conservative=calibrated-uncertainty
+        return max(.03,min(.97,conservative)), maturity
 
     def learn(self, market, x, won):
         y=1 if won else 0
