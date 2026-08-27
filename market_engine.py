@@ -4,6 +4,9 @@ from datetime import datetime, timezone, timedelta
 from itertools import combinations
 import auto_data as fd
 
+_RECENT_CACHE={}
+_ODDS_CACHE={}
+
 def _pois(k,l): return math.exp(-l)*l**k/math.factorial(k)
 def _num(v):
     try:return float(v)
@@ -28,27 +31,41 @@ def _total_prob(lam,line,over=True):
     return p
 def _stage(m):
     if not isinstance(m,dict):return None
-    # 5Dollar currently uses opening / closing / inplay. Closing is latest pre-match.
     for k in ('closing','current','opening','inplay'):
         if isinstance(m.get(k),dict):return m[k]
     return m if any(k in m for k in ('home','away','over','under','draw','yes','no')) else None
-def _odds_payload(fid):
-    raw=fd._get(f'/fixtures/{fid}/odds',{'bookmakers':'bet365'})
-    # Official API envelope: {success:1,data:{fixture_id,bookmakers:[...]}}
-    data=raw.get('data',raw) if isinstance(raw,dict) else {}
+def _normalize_odds(data):
     if not isinstance(data,dict):return {}
     books=data.get('bookmakers') or []
     if books:
         b=next((x for x in books if str(x.get('slug','')).lower()=='bet365'),books[0])
         return b.get('odds') or b.get('markets') or {}
-    return data.get('odds') or data.get('markets') or {}
+    return data.get('odds') or data.get('markets') or data
+
+def _odds_payload(fid,inline=None):
+    # /fixtures?include=odds returns Bet365 odds inline. Prefer that so a day costs
+    # 1-2 requests instead of one extra request for every fixture.
+    inline_odds=_normalize_odds(inline) if inline else {}
+    if inline_odds and any(k in inline_odds for k in ('1x2','asian_handicap','asian','goal_line','goalline','corner_line','corner','cards','card_line')):
+        return inline_odds
+    if fid in _ODDS_CACHE:return _ODDS_CACHE[fid]
+    raw=fd._get(f'/fixtures/{fid}/odds',{'bookmakers':'bet365'})
+    odds=_normalize_odds(raw)
+    _ODDS_CACHE[fid]=odds
+    return odds
+
 def _recent(team_id,before,n=12):
     if not team_id:return []
+    key=(team_id,int(before)//86400,n)
+    if key in _RECENT_CACHE:return _RECENT_CACHE[key]
     raw=fd._get(f'/teams/{team_id}/fixtures',{'status':'finished','end_time':before,'per_page':min(50,max(20,n*2))})
     data=raw.get('data',raw) if isinstance(raw,dict) else raw
     if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or []
     else:rows=data or []
-    rows=[x for x in rows if (x.get('goals') or {}).get('home') is not None];rows.sort(key=lambda x:x.get('kickoff_ts') or 0,reverse=True);return rows[:n]
+    rows=[x for x in rows if (x.get('goals') or {}).get('home') is not None];rows.sort(key=lambda x:x.get('kickoff_ts') or 0,reverse=True);rows=rows[:n]
+    _RECENT_CACHE[key]=rows
+    return rows
+
 def _team_rates(tid,games):
     gf=ga=cf=ca=yf=ya=ws=0
     for i,m in enumerate(games):
@@ -65,7 +82,7 @@ def _add(out,name,p,odd,src):
     p=max(.02,min(.98,p));imp=1/odd;cal=max(.03,min(.97,.62*p+.38*imp));ev=(cal*odd-1)*100
     out.append({'market':name,'probability':round(cal*100,1),'raw_probability':round(p*100,1),'bookmaker_odds':round(odd,2),'fair_odds':round(1/cal,2),'ev':round(ev,1),'safe':cal>=.64,'value':ev>=2,'suspicious':abs(p-imp)>.25,'source':src,'recommendation_score':round(cal*100+max(-5,min(10,ev))*.15,1)})
 def analyze_fixture(f):
-    teams=f.get('teams') or {};h=teams.get('home') or {};a=teams.get('away') or {};fid=f.get('id');ts=f.get('kickoff_ts') or int(datetime.now(timezone.utc).timestamp());hr=_team_rates(h.get('id'),_recent(h.get('id'),ts));ar=_team_rates(a.get('id'),_recent(a.get('id'),ts));lh=max(.15,(hr['gf']+ar['ga'])/2*1.06);la=max(.15,(ar['gf']+hr['ga'])/2*.96);hp,dp,ap,g=_score_probs(lh,la);odds=_odds_payload(fid);picks=[]
+    teams=f.get('teams') or {};h=teams.get('home') or {};a=teams.get('away') or {};fid=f.get('id');ts=f.get('kickoff_ts') or int(datetime.now(timezone.utc).timestamp());hr=_team_rates(h.get('id'),_recent(h.get('id'),ts));ar=_team_rates(a.get('id'),_recent(a.get('id'),ts));lh=max(.15,(hr['gf']+ar['ga'])/2*1.06);la=max(.15,(ar['gf']+hr['ga'])/2*.96);hp,dp,ap,g=_score_probs(lh,la);odds=_odds_payload(fid,f);picks=[]
     m=_stage(odds.get('1x2'))
     if m:_add(picks,'1',hp,m.get('home'),'Bet365 1X2');_add(picks,'X',dp,m.get('draw'),'Bet365 1X2');_add(picks,'2',ap,m.get('away'),'Bet365 1X2')
     m=_stage(odds.get('asian_handicap') or odds.get('asian'))
@@ -76,13 +93,21 @@ def analyze_fixture(f):
     for keys,label,lam in specs:
         market=next((odds.get(k) for k in keys if odds.get(k)),None);m=_stage(market);line=_num(m.get('line')) if m else None
         if line is not None:_add(picks,('Over ' if label=='Goals' else label+' Over ')+f'{line:g}',_total_prob(lam,line,True),m.get('over'),'Bet365 '+label);_add(picks,('Under ' if label=='Goals' else label+' Under ')+f'{line:g}',_total_prob(lam,line,False),m.get('under'),'Bet365 '+label)
-    # Keep valid priced markets; suspicious selections stay visible but cannot enter combo.
     picks.sort(key=lambda x:(not x['suspicious'],x['safe'],x['recommendation_score']),reverse=True);usable=[x for x in picks if not x['suspicious']];best=usable[0] if usable else (picks[0] if picks else None)
     return {'fixture_id':fid,'kickoff':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'league':(f.get('league') or {}).get('name',''),'country':'','home':h.get('name','?'),'away':a.get('name','?'),'home_xg':round(lh,2),'away_xg':round(la,2),'confidence':'ridicată' if min(hr['n'],ar['n'])>=8 else 'medie','markets':picks,'best_market':best,'best_value':next((x for x in usable if x['value']),None),'home_last':hr['n'],'away_last':ar['n'],'odds_markets':list(odds.keys())}
+
 def _day_fixtures(day):
-    start=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp());raw=fd._get('/fixtures',{'start_time':start,'end_time':start+86400,'per_page':100});data=raw.get('data',raw) if isinstance(raw,dict) else raw
-    if isinstance(data,dict):return data.get('fixtures') or data.get('data') or []
-    return data or []
+    start=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp());out=[]
+    # include=odds is explicitly supported by 5Dollar and caps pages at 50.
+    for page in range(1,10):
+        raw=fd._get('/fixtures',{'start_time':start,'end_time':start+86400,'include':'odds','per_page':50,'page':page})
+        data=raw.get('data',raw) if isinstance(raw,dict) else raw
+        if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or [];pag=data.get('pagination') or {}
+        else:rows=data or [];pag={}
+        out.extend(rows)
+        if not rows or (not pag.get('has_more') and len(rows)<50):break
+    return out
+
 def build_combo(rows,target):
     cs=[]
     for r in rows:
