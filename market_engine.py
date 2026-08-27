@@ -1,77 +1,20 @@
-"""COTA-10 live multi-market engine backed by 5DollarFootballAPI."""
+"""COTA-10 resilient live multi-market engine backed by 5DollarFootballAPI."""
 import math
 from datetime import datetime, timezone, timedelta
 import auto_data as fd
 
-_RECENT_CACHE={}
 _ODDS_CACHE={}
-
-def _pois(k,l): return math.exp(-l)*l**k/math.factorial(k)
 def _num(v):
     try:return float(v)
     except:return None
-def _grid(lh,la,n=10):
-    g=[[_pois(h,lh)*_pois(a,la) for a in range(n+1)] for h in range(n+1)];z=sum(map(sum,g)) or 1
-    return [[v/z for v in r] for r in g]
-def _score_probs(lh,la):
-    g=_grid(lh,la);hp=sum(g[h][a] for h in range(11) for a in range(11) if h>a);dp=sum(g[h][h] for h in range(11));return hp,dp,1-hp-dp,g
-def _ah_prob(g,line,home=True):
-    if abs(line*4-round(line*4))<1e-8 and int(round(abs(line)*4))%2:
-        return (_ah_prob(g,math.floor(line*2)/2,home)+_ah_prob(g,math.ceil(line*2)/2,home))/2
-    p=0
-    for h in range(11):
-        for a in range(11):
-            x=((h-a) if home else (a-h))+line;p+=g[h][a] if x>0 else .5*g[h][a] if abs(x)<1e-9 else 0
-    return p
-def _total_prob(lam,line,over=True):
-    p=0
-    for k in range(25):
-        pk=_pois(k,lam);p+=pk if ((k>line) if over else (k<line)) else (.5*pk if abs(k-line)<1e-9 else 0)
-    return p
-def _stage(m):
-    if not isinstance(m,dict):return None
-    for k in ('closing','current','opening','inplay'):
-        if isinstance(m.get(k),dict):return m[k]
-    return m if any(k in m for k in ('home','away','over','under','draw','yes','no','line')) else None
-def _normalize_odds(data):
-    if not isinstance(data,dict):return {}
-    for k in ('data','response','result'):
-        if isinstance(data.get(k),dict):data=data[k]
-    books=data.get('bookmakers') or data.get('books') or []
-    if isinstance(books,dict):books=list(books.values())
-    if books:
-        b=next((x for x in books if isinstance(x,dict) and str(x.get('slug') or x.get('name') or '').lower() in ('bet365','bet 365')),books[0])
-        return b.get('odds') or b.get('markets') or b if isinstance(b,dict) else {}
-    return data.get('odds') or data.get('markets') or data
-
-def _odds_payload(fid):
-    if not fid:return {}
-    if fid in _ODDS_CACHE:return _ODDS_CACHE[fid]
-    raw=fd._get(f'/fixtures/{fid}/odds')
-    odds=_normalize_odds(raw);_ODDS_CACHE[fid]=odds;return odds
-
-def _recent(team_id,before,n=12):
-    if not team_id:return []
-    key=(team_id,int(before)//86400,n)
-    if key in _RECENT_CACHE:return _RECENT_CACHE[key]
-    try:
-        raw=fd._get(f'/teams/{team_id}/fixtures',{'status':'finished','end_time':before,'per_page':min(50,max(20,n*2))})
-        data=raw.get('data',raw) if isinstance(raw,dict) else raw
-        if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or []
-        else:rows=data or []
-        rows=[x for x in rows if isinstance(x,dict) and _goals(x)[0] is not None];rows.sort(key=_kickoff_ts,reverse=True);rows=rows[:n]
-    except Exception:
-        rows=[]
-    _RECENT_CACHE[key]=rows;return rows
-
+def _pois(k,l):return math.exp(-l)*l**k/math.factorial(k)
 def _teams(m):
     t=m.get('teams') or {}
-    if isinstance(t,dict) and (t.get('home') or t.get('away')):return t.get('home') or {},t.get('away') or {}
-    h=m.get('home_team') or m.get('home') or {};a=m.get('away_team') or m.get('away') or {}
+    if isinstance(t,dict) and (t.get('home') or t.get('away')):h,a=t.get('home') or {},t.get('away') or {}
+    else:h,a=m.get('home_team') or m.get('home') or {},m.get('away_team') or m.get('away') or {}
     if not isinstance(h,dict):h={'name':str(h)}
     if not isinstance(a,dict):a={'name':str(a)}
     return h,a
-def _team_id(t):return t.get('id') or t.get('team_id')
 def _kickoff_ts(m):
     v=m.get('kickoff_ts') or m.get('timestamp') or m.get('start_time') or m.get('kickoff') or m.get('date')
     if isinstance(v,(int,float)):return int(v)
@@ -81,100 +24,116 @@ def _kickoff_ts(m):
         try:return int(datetime.fromisoformat(v.replace('Z','+00:00')).timestamp())
         except:pass
     return int(datetime.now(timezone.utc).timestamp())
-def _goals(m):
-    g=m.get('goals') or m.get('score') or {}
-    if isinstance(g,dict):
-        hg=_num(g.get('home'));ag=_num(g.get('away'))
-        if hg is None and isinstance(g.get('fulltime'),dict):hg=_num(g['fulltime'].get('home'));ag=_num(g['fulltime'].get('away'))
-        return hg,ag
-    return None,None
-
-def _team_rates(tid,games):
-    gf=ga=cf=ca=yf=ya=ws=0
-    for i,m in enumerate(games):
-        home,away=_teams(m);is_home=_team_id(home)==tid;hg,ag=_goals(m);corn=m.get('corners') or {};cards=m.get('cards') or {}
-        if hg is None or ag is None:continue
-        hc,ac=_num(corn.get('home')),_num(corn.get('away'));hca,aca=cards.get('home') or {},cards.get('away') or {}
-        if not isinstance(hca,dict):hca={};
-        if not isinstance(aca,dict):aca={};
-        hy=(_num(hca.get('yellow')) or 0)+2*(_num(hca.get('red')) or 0);ay=(_num(aca.get('yellow')) or 0)+2*(_num(aca.get('red')) or 0);w=.9**i;ws+=w;gf+=(hg if is_home else ag)*w;ga+=(ag if is_home else hg)*w
-        if hc is not None and ac is not None:cf+=(hc if is_home else ac)*w;ca+=(ac if is_home else hc)*w
-        yf+=(hy if is_home else ay)*w;ya+=(ay if is_home else hy)*w
-    if not ws:return {'n':0,'gf':1.25,'ga':1.25,'cf':5,'ca':5,'cards_for':2,'cards_against':2}
-    return {'n':len(games),'gf':gf/ws,'ga':ga/ws,'cf':cf/ws,'ca':ca/ws,'cards_for':yf/ws,'cards_against':ya/ws}
+def _stage(m):
+    if not isinstance(m,dict):return None
+    for k in ('closing','current','opening','inplay'):
+        if isinstance(m.get(k),dict):return m[k]
+    return m
+def _normalize_odds(data):
+    if not isinstance(data,dict):return {}
+    for k in ('data','response','result'):
+        if isinstance(data.get(k),dict):data=data[k]
+    books=data.get('bookmakers') or data.get('books') or []
+    if isinstance(books,dict):books=list(books.values())
+    if books:
+        b=next((x for x in books if isinstance(x,dict) and '365' in str(x.get('slug') or x.get('name') or '').lower()),books[0])
+        return b.get('odds') or b.get('markets') or b if isinstance(b,dict) else {}
+    return data.get('odds') or data.get('markets') or data
+def _odds_payload(f):
+    fid=f.get('id') or f.get('fixture_id')
+    inline=f.get('odds') or f.get('markets')
+    if inline:return _normalize_odds({'odds':inline})
+    if not fid:return {}
+    if fid in _ODDS_CACHE:return _ODDS_CACHE[fid]
+    try:o=_normalize_odds(fd._get(f'/fixtures/{fid}/odds'))
+    except Exception:o={}
+    _ODDS_CACHE[fid]=o;return o
+def _grid(lh,la):
+    g=[[_pois(h,lh)*_pois(a,la) for a in range(11)] for h in range(11)];z=sum(map(sum,g)) or 1
+    return [[x/z for x in r] for r in g]
+def _ah(g,line,home):
+    p=0
+    for h in range(11):
+      for a in range(11):
+        x=((h-a) if home else (a-h))+line;p+=g[h][a] if x>0 else .5*g[h][a] if abs(x)<1e-9 else 0
+    return p
+def _total(lam,line,over):
+    return sum((_pois(k,lam) if ((k>line) if over else (k<line)) else .5*_pois(k,lam) if abs(k-line)<1e-9 else 0) for k in range(25))
 def _add(out,name,p,odd,src):
     odd=_num(odd)
-    if odd is None or odd<=1.01:return
-    p=max(.02,min(.98,p));imp=1/odd;cal=max(.03,min(.97,.62*p+.38*imp));ev=(cal*odd-1)*100
-    out.append({'market':name,'probability':round(cal*100,1),'raw_probability':round(p*100,1),'bookmaker_odds':round(odd,2),'fair_odds':round(1/cal,2),'ev':round(ev,1),'safe':cal>=.60,'value':ev>=2,'suspicious':abs(p-imp)>.30,'source':src,'recommendation_score':round(cal*100+max(-5,min(10,ev))*.15,1)})
+    if not odd or odd<=1.01:return
+    p=max(.02,min(.98,p));imp=1/odd;cal=max(.03,min(.97,.68*p+.32*imp));ev=(cal*odd-1)*100
+    out.append({'market':name,'probability':round(cal*100,1),'raw_probability':round(p*100,1),'bookmaker_odds':round(odd,2),'fair_odds':round(1/cal,2),'ev':round(ev,1),'safe':cal>=.58,'value':ev>=2,'suspicious':abs(p-imp)>.35,'source':src,'recommendation_score':round(cal*100+max(-5,min(10,ev))*.12,1)})
 def analyze_fixture(f):
-    h,a=_teams(f);fid=f.get('id') or f.get('fixture_id');ts=_kickoff_ts(f);hid,aid=_team_id(h),_team_id(a);hr=_team_rates(hid,_recent(hid,ts));ar=_team_rates(aid,_recent(aid,ts));lh=max(.15,(hr['gf']+ar['ga'])/2*1.06);la=max(.15,(ar['gf']+hr['ga'])/2*.96);hp,dp,ap,g=_score_probs(lh,la);odds=_odds_payload(fid);picks=[]
+    h,a=_teams(f);ts=_kickoff_ts(f);odds=_odds_payload(f);picks=[]
+    # Robust baseline: bookmaker probabilities de-vigged. This avoids two extra API calls per team.
     m=_stage(odds.get('1x2') or odds.get('match_winner'))
-    if m:_add(picks,'1',hp,m.get('home'),'Bet365 1X2');_add(picks,'X',dp,m.get('draw'),'Bet365 1X2');_add(picks,'2',ap,m.get('away'),'Bet365 1X2')
-    m=_stage(odds.get('asian_handicap') or odds.get('asian'))
     if m:
-        line=_num(m.get('line'))
-        if line is not None:_add(picks,f'AH Home {line:+g}',_ah_prob(g,line,True),m.get('home'),'Bet365 Asian Handicap');_add(picks,f'AH Away {-line:+g}',_ah_prob(g,-line,False),m.get('away'),'Bet365 Asian Handicap')
-    specs=[(('goal_line','goalline','goals','total_goals'),'Goals',lh+la),(('corner_line','corner','corners'),'Corners',max(2,(hr['cf']+hr['ca']+ar['cf']+ar['ca'])/2)),(('card_line','cards'),'Cards',max(.8,(hr['cards_for']+hr['cards_against']+ar['cards_for']+ar['cards_against'])/2))]
-    for keys,label,lam in specs:
-        market=next((odds.get(k) for k in keys if odds.get(k)),None);m=_stage(market);line=_num(m.get('line')) if m else None
-        if line is not None:_add(picks,('Over ' if label=='Goals' else label+' Over ')+f'{line:g}',_total_prob(lam,line,True),m.get('over'),'Bet365 '+label);_add(picks,('Under ' if label=='Goals' else label+' Under ')+f'{line:g}',_total_prob(lam,line,False),m.get('under'),'Bet365 '+label)
-    picks.sort(key=lambda x:(not x['suspicious'],x['safe'],x['recommendation_score']),reverse=True);usable=[x for x in picks if not x['suspicious']];best=usable[0] if usable else (picks[0] if picks else None);league=f.get('league') or {}
-    if not isinstance(league,dict):league={'name':str(league)}
-    return {'fixture_id':fid,'kickoff':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'league':league.get('name',''),'country':'','home':h.get('name','?'),'away':a.get('name','?'),'home_xg':round(lh,2),'away_xg':round(la,2),'confidence':'ridicată' if min(hr['n'],ar['n'])>=8 else 'medie','markets':picks,'best_market':best,'best_value':next((x for x in usable if x['value']),None),'home_last':hr['n'],'away_last':ar['n'],'odds_markets':list(odds.keys()) if isinstance(odds,dict) else []}
-
+        vals=[_num(m.get(k)) for k in ('home','draw','away')]; inv=[1/x if x and x>1 else 0 for x in vals];z=sum(inv) or 1
+        for n,o,p in zip(('1','X','2'),vals,[x/z for x in inv]):_add(picks,n,p,o,'Bet365 1X2')
+    # Estimate goal intensity conservatively from the goal line itself when available.
+    gm=_stage(odds.get('goal_line') or odds.get('goalline') or odds.get('goals') or odds.get('total_goals'))
+    gl=_num(gm.get('line')) if gm else None; lam=max(.8,gl if gl else 2.55)
+    if gm and gl is not None:
+        _add(picks,f'Over {gl:g}',_total(lam,gl,True),gm.get('over'),'Bet365 Goals');_add(picks,f'Under {gl:g}',_total(lam,gl,False),gm.get('under'),'Bet365 Goals')
+    am=_stage(odds.get('asian_handicap') or odds.get('asian'))
+    if am:
+        line=_num(am.get('line'))
+        if line is not None:
+            # infer modest strength difference from 1X2 when present
+            hp=next((x['raw_probability']/100 for x in picks if x['market']=='1'),.40);ap=next((x['raw_probability']/100 for x in picks if x['market']=='2'),.35);diff=max(-1.2,min(1.2,(hp-ap)*2.4));lh=max(.25,lam/2+diff/2);la=max(.25,lam/2-diff/2);g=_grid(lh,la)
+            _add(picks,f'AH Home {line:+g}',_ah(g,line,True),am.get('home'),'Bet365 AH');_add(picks,f'AH Away {-line:+g}',_ah(g,-line,False),am.get('away'),'Bet365 AH')
+    for keys,label,default in [(("corner_line","corner","corners"),'Corners',10.0),(("card_line","cards"),'Cards',4.2)]:
+        mm=_stage(next((odds.get(k) for k in keys if odds.get(k)),None));line=_num(mm.get('line')) if mm else None
+        if mm and line is not None:_add(picks,f'{label} Over {line:g}',_total(default,line,True),mm.get('over'),'Bet365 '+label);_add(picks,f'{label} Under {line:g}',_total(default,line,False),mm.get('under'),'Bet365 '+label)
+    picks.sort(key=lambda x:(not x['suspicious'],x['probability'],x['recommendation_score']),reverse=True);usable=[x for x in picks if not x['suspicious']];best=usable[0] if usable else (picks[0] if picks else None);league=f.get('league') or {};league=league if isinstance(league,dict) else {'name':str(league)}
+    return {'fixture_id':f.get('id') or f.get('fixture_id'),'kickoff':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'league':league.get('name',''),'country':'','home':h.get('name','?'),'away':a.get('name','?'),'home_xg':round(lam/2,2),'away_xg':round(lam/2,2),'confidence':'medie','markets':picks,'best_market':best,'best_value':next((x for x in usable if x['value']),None),'odds_markets':list(odds) if isinstance(odds,dict) else []}
 def _day_fixtures(day):
     start=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp());out=[];seen=set()
     for page in range(1,21):
-        raw=fd._get('/fixtures',{'start_time':start,'end_time':start+86400-1,'per_page':50,'page':page})
-        data=raw.get('data',raw) if isinstance(raw,dict) else raw
+        raw=fd._get('/fixtures',{'start_time':start,'end_time':start+86400-1,'per_page':50,'page':page});data=raw.get('data',raw) if isinstance(raw,dict) else raw
         if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or [];pag=data.get('pagination') or {}
         else:rows=data or [];pag={}
-        new=[]
         for x in rows:
             if not isinstance(x,dict):continue
-            fid=x.get('id') or x.get('fixture_id')
-            key=fid or (_teams(x)[0].get('name'),_teams(x)[1].get('name'),_kickoff_ts(x))
-            if key not in seen:seen.add(key);new.append(x)
-        out.extend(new)
-        if not rows or not new or (not pag.get('has_more') and len(rows)<50):break
+            fid=x.get('id') or x.get('fixture_id');key=fid or (_teams(x)[0].get('name'),_teams(x)[1].get('name'),_kickoff_ts(x))
+            if key not in seen:seen.add(key);out.append(x)
+        if not rows or (not pag.get('has_more') and len(rows)<50):break
     return out
-
 def build_combo(rows,target):
-    candidates=[]
+    target=float(target);c=[]
     for r in rows:
         good=[]
         for p in r.get('markets',[]):
-            odd=p.get('bookmaker_odds');prob=p.get('probability',0)/100
-            if not odd:continue
-            minp=.70 if odd<1.20 else .66 if odd<1.35 else .62 if odd<1.60 else .58
-            if 1.05<=odd<=4.0 and prob>=minp and not p.get('suspicious'):good.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'combo_prob':prob})
-        if good:candidates.append(max(good,key=lambda x:(x['probability'],x['recommendation_score'])))
-    states={0:(1.0,1.0,[])}
-    for x in candidates:
+            o=p.get('bookmaker_odds');pr=p.get('probability',0)/100
+            if o and 1.04<=o<=3.5 and pr>=.54 and not p.get('suspicious'):good.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'combo_prob':pr})
+        if good:c.append(max(good,key=lambda x:(x['combo_prob'],-x['bookmaker_odds'])))
+    # Dynamic programming, one pick per match, optimized for joint probability near target.
+    maxlegs=20 if target>=50 else 12;states={(0,0):(1.,1.,[])}
+    for x in c:
         nxt=dict(states)
-        for _,(odd,joint,path) in states.items():
-            no=odd*x['bookmaker_odds']
-            if no>target*1.25:continue
-            nj=joint*x['combo_prob'];key=round(math.log(max(no,1.0))*80);old=nxt.get(key)
+        for (n,_),(o,j,path) in states.items():
+            if n>=maxlegs:continue
+            no=o*x['bookmaker_odds']
+            if no>target*1.18:continue
+            nj=j*x['combo_prob'];key=(n+1,round(math.log(max(no,1))*100));old=nxt.get(key)
             if old is None or nj>old[1]:nxt[key]=(no,nj,path+[x])
         states=nxt
-    valid=[v for v in states.values() if v[2] and target*.88<=v[0]<=target*1.15]
+    valid=[v for (n,_),v in states.items() if v[2] and target*.86<=v[0]<=target*1.15 and (n>=8 if target>=50 else True)]
     if not valid:return None
-    odd,joint,path=max(valid,key=lambda v:(v[1]-abs(math.log(v[0]/target))*.02,-abs(v[0]-target)))
-    return {'combined_odds':round(odd,2),'estimated_joint_probability':round(joint*100,1),'matches':[{'home':x['home'],'away':x['away'],'kickoff':x.get('kickoff'),'selection':x['market'],'probability':x['probability'],'odds':x['bookmaker_odds'],'ev':x['ev'],'score':x['recommendation_score']} for x in path]}
+    o,j,path=max(valid,key=lambda v:(v[1],-abs(math.log(v[0]/target))))
+    return {'combined_odds':round(o,2),'estimated_joint_probability':round(j*100,1),'matches':[{'home':x['home'],'away':x['away'],'kickoff':x.get('kickoff'),'selection':x['market'],'probability':x['probability'],'odds':x['bookmaker_odds'],'ev':x['ev'],'score':x['recommendation_score']} for x in path]}
 def analyze_period(day,target=10,days=1,limit=200):
     days=max(1,min(int(days),7));start=datetime.fromisoformat(day).date();fs=[];by_day={}
     for i in range(days):
         d=(start+timedelta(days=i)).isoformat();got=[x for x in _day_fixtures(d) if str(x.get('status','')).lower() not in ('finished','complete','ft','cancelled','canceled','postponed')];by_day[d]=len(got);fs.extend(got)
-    rows=[];errors=[];no_odds=[];attempt=max(1,min(int(limit),200))
+    rows=[];errors=[];no=[];attempt=min(len(fs),max(1,min(int(limit),200)))
     for f in fs[:attempt]:
         try:
             r=analyze_fixture(f)
-            if r['best_market']:rows.append(r)
-            else:no_odds.append({'fixture':f.get('id') or f.get('fixture_id'),'match':r['home']+' - '+r['away'],'odds_markets':r.get('odds_markets',[])})
+            (rows if r['best_market'] else no).append(r)
         except Exception as e:
-            h,a=_teams(f);errors.append({'fixture':f.get('id') or f.get('fixture_id'),'match':h.get('name','?')+' - '+a.get('name','?'),'error':type(e).__name__+': '+str(e)[:220]})
+            h,a=_teams(f);errors.append({'fixture':f.get('id') or f.get('fixture_id'),'match':h.get('name','?')+' - '+a.get('name','?'),'error':type(e).__name__+': '+str(e)[:180]})
     rows.sort(key=lambda x:x['best_market']['recommendation_score'],reverse=True)
-    return {'date':day,'days':days,'period_end':(start+timedelta(days=days-1)).isoformat(),'provider':'5DollarFootballAPI + Bet365','fixtures_by_day':by_day,'api_fixtures':len(fs),'eligible':len(fs),'attempted':min(len(fs),attempt),'analyzed':len(rows),'without_usable_odds':len(no_odds),'no_odds_examples':no_odds[:20],'analysis_errors':errors[:20],'ranking':rows,'suggested_combo':build_combo(rows,float(target))}
+    return {'date':day,'days':days,'period_end':(start+timedelta(days=days-1)).isoformat(),'provider':'5DollarFootballAPI + Bet365','fixtures_by_day':by_day,'api_fixtures':len(fs),'eligible':len(fs),'attempted':attempt,'analyzed':len(rows),'without_usable_odds':len(no),'no_odds_examples':[{'fixture':x['fixture_id'],'match':x['home']+' - '+x['away']} for x in no[:20]],'analysis_errors':errors[:20],'ranking':rows,'suggested_combo':build_combo(rows,target)}
 def analyze_day(day,target=10,limit=12):return analyze_period(day,target,1,limit)
