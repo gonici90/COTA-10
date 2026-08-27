@@ -9,12 +9,10 @@ from auto_data import router as data_router
 app=core.app
 core._cacheable=lambda path:path.startswith('/matches')
 
-# For large targets, prefer many safer low-odds legs instead of a short ticket
-# made from aggressive prices. We still maximize the estimated joint probability.
 def safer_build_combo(rows,target):
     target=float(target)
-    candidates=[]
     high_target=target>=50
+    candidates=[]
     for r in rows:
         good=[]
         for p in r.get('markets',[]):
@@ -22,44 +20,41 @@ def safer_build_combo(rows,target):
             if not odd: continue
             odd=float(odd)
             if high_target:
-                # COTA 100: deliberately search the safer 1.10-1.65 band.
-                minp=.72 if odd<1.20 else .68 if odd<1.35 else .64 if odd<1.50 else .61
-                allowed=1.10<=odd<=1.65
+                minp=.74 if odd<1.20 else .70 if odd<1.30 else .67 if odd<1.40 else .64 if odd<=1.50 else .61
+                allowed=1.08<=odd<=1.65
             else:
                 minp=.70 if odd<1.20 else .66 if odd<1.35 else .62 if odd<1.60 else .58
                 allowed=1.05<=odd<=4.0
             if allowed and prob>=minp and not p.get('suspicious'):
                 good.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'combo_prob':prob})
         if good:
-            # One selection per match; choose safety first, score second.
-            candidates.append(max(good,key=lambda x:(x['combo_prob'],x['recommendation_score'])))
+            candidates.append(max(good,key=lambda x:(x['combo_prob'], -x['bookmaker_odds'], x['recommendation_score'])))
 
-    # DP keeps the best probability for each odds bucket AND leg count.
-    # This lets a 15-leg low-odds ticket compete fairly with an 8-leg ticket.
-    states={(0,0):(1.0,1.0,[])}
-    max_legs=20 if high_target else min(12,len(candidates))
-    for x in candidates:
-        nxt=dict(states)
-        for (legs,_),(odd,joint,path) in states.items():
-            if legs>=max_legs: continue
-            no=odd*x['bookmaker_odds']
-            if no>target*1.18: continue
-            nj=joint*x['combo_prob']; nl=legs+1
-            bucket=round(math.log(max(no,1.0))*100)
-            key=(nl,bucket); old=nxt.get(key)
-            if old is None or nj>old[1]: nxt[key]=(no,nj,path+[x])
-        states=nxt
+    def search(max_odd,min_legs,max_legs):
+        pool=[x for x in candidates if x['bookmaker_odds']<=max_odd]
+        states={(0,0):(1.0,1.0,[])}
+        for x in pool:
+            nxt=dict(states)
+            for (legs,_),(odd,joint,path) in states.items():
+                if legs>=max_legs: continue
+                no=odd*x['bookmaker_odds']
+                if no>target*1.15: continue
+                nj=joint*x['combo_prob']; nl=legs+1
+                bucket=round(math.log(max(no,1.0))*120)
+                key=(nl,bucket); old=nxt.get(key)
+                if old is None or nj>old[1]: nxt[key]=(no,nj,path+[x])
+            states=nxt
+        valid=[v for (legs,_),v in states.items() if min_legs<=legs<=max_legs and target*.88<=v[0]<=target*1.12]
+        if not valid:return None
+        return max(valid,key=lambda v:(v[1],-abs(math.log(v[0]/target))))
 
-    valid=[]
-    for (legs,_),v in states.items():
-        if not v[2] or not (target*.90<=v[0]<=target*1.12): continue
-        if high_target and not (8<=legs<=20): continue
-        valid.append(v)
-    if not valid:return None
-
-    # Primary objective is the probability that the whole ticket wins.
-    # Closeness to the requested target is only the tie-breaker.
-    odd,joint,path=max(valid,key=lambda v:(v[1],-abs(math.log(v[0]/target))))
+    if high_target:
+        # First choice: genuinely long, low-odds ticket. Only relax if impossible.
+        best=search(1.50,12,20) or search(1.60,10,20) or search(1.65,8,20)
+    else:
+        best=search(4.0,1,12)
+    if not best:return None
+    odd,joint,path=best
     return {'combined_odds':round(odd,2),'estimated_joint_probability':round(joint*100,1),'matches':[{'home':x['home'],'away':x['away'],'kickoff':x.get('kickoff'),'selection':x['market'],'probability':x['probability'],'odds':x['bookmaker_odds'],'ev':x['ev'],'score':x['recommendation_score']} for x in path]}
 
 market_engine.build_combo=safer_build_combo
