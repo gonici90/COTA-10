@@ -5,34 +5,22 @@ from fastapi.responses import HTMLResponse
 from ticket_engine import router
 from auto_data import router as data_router
 
-app = core.app
-core._cacheable = lambda path: path.startswith('/matches')
+app=core.app
+core._cacheable=lambda path:path.startswith('/matches')
+_old=next((r for r in app.router.routes if getattr(r,'path',None)=='/api/analyze'),None)
+if _old:app.router.routes.remove(_old)
 
-_old_analyze_route = next((r for r in app.router.routes if getattr(r, 'path', None) == '/api/analyze'), None)
-if _old_analyze_route:
-    app.router.routes.remove(_old_analyze_route)
-
+WINDOWS={1.5:1,5.0:2,10.0:4,100.0:7}
 @app.get('/api/analyze')
-async def analyze_multimarket(day: str = Query(default_factory=lambda: core.date.today().isoformat()), limit: int = 12, target: float = 10.0):
-    return market_engine.analyze_day(day=day, target=target, limit=limit)
+async def analyze_multimarket(day:str=Query(default_factory=lambda:core.date.today().isoformat()),target:float=10.0):
+    supported=min(WINDOWS,key=lambda x:abs(x-target)); days=WINDOWS[supported]
+    return market_engine.analyze_period(day=day,target=supported,days=days,limit=80)
 
-app.router.routes[:] = [r for r in app.router.routes if getattr(r, 'path', None) != '/api/backtest']
-app.include_router(router)
-app.include_router(data_router)
+app.router.routes[:]=[r for r in app.router.routes if getattr(r,'path',None)!='/api/backtest']
+app.include_router(router);app.include_router(data_router)
+_old_home=next((r for r in app.router.routes if getattr(r,'path',None)=='/'),None)
+if _old_home:app.router.routes.remove(_old_home)
 
-_old_home_route = next((r for r in app.router.routes if getattr(r, 'path', None) == '/'), None)
-_old_home = _old_home_route.endpoint if _old_home_route else None
-if _old_home_route:
-    app.router.routes.remove(_old_home_route)
-
-@app.get('/', response_class=HTMLResponse)
-def home_extended():
-    base = _old_home()
-    html = base.body.decode('utf-8') if hasattr(base, 'body') else str(base)
-    marker = '<button onclick="bt(90)">Backtest 90 zile</button>'
-    extra = marker + '<br><button onclick="ticketBt(1.5,90)">90 zile · COTA 1.50</button><button onclick="ticketBt(2,90)">90 zile · COTA 2</button><button onclick="ticketBt(5,90)">90 zile · COTA 5</button><button onclick="ticketBt(10,90)">90 zile · COTA 10</button><br><button onclick="ticketBt(1.5,180)">180 zile · COTA 1.50</button><button onclick="ticketBt(1.5,365)">365 zile · COTA 1.50</button><br><button onclick="syncData()">Actualizează date</button>'
-    html = html.replace(marker, extra, 1)
-    js = r'''async function syncData(){let o=out;o.innerHTML='<p>Actualizez baza 5Dollar...</p>';try{let r=await fetch('/api/data/sync?days=7&force=true',{method:'POST'}),x=await r.json();if(!r.ok)throw Error(x.detail||'Eroare');o.innerHTML='<div class="card"><div class="prob">Date 5Dollar actualizate</div><b>'+val(x.matches,0)+' meciuri</b> · '+val(x.finished,0)+' terminate<br><small>'+val(x.market_snapshots,0)+' piețe stocate · '+val(x.api_days_fetched,0)+' zile din API</small></div>'}catch(e){o.innerHTML='<div class="card warn">Eroare actualizare: '+e.message+'</div>'}}
-async function ticketBt(target,days=90){let o=out;o.innerHTML='<p>Simulez biletele COTA '+target+' pe '+days+' zile...</p>';try{let r=await fetch('/api/backtest?days='+days+'&per_day=100'),x=await r.json();if(!r.ok)throw Error(x.detail||'Eroare');let b=(x.ticket_backtests||{})[String(target)],c=x.coverage||{};if(!b)throw Error('Backtestul de bilete nu este disponibil');let h='<h2>Backtest '+days+' zile · COTA '+target+'</h2><div class="card"><div class="prob">'+val(b.hit_rate,0)+'% bilete câștigate</div><b>'+val(b.wins,0)+' câștigate / '+val(b.tickets,0)+' bilete</b><br>Cotă medie '+val(b.avg_odds,0)+' · ROI '+val(b.roi,0)+'% · profit '+val(b.profit,0)+' unități</div>';h+='<h2>Acoperire reală</h2><div class="card"><b>Interval cerut:</b> '+(c.requested_start||'?')+' → '+(c.dataset_end||'?')+'<br><b>Date efectiv disponibile:</b> '+(c.actual_start||'—')+' → '+(c.actual_end||'—')+'<br><b>Zile calendaristice acoperite:</b> '+val(c.calendar_days_covered,0)+' / '+val(c.days_requested,days)+'<br><b>Zile cu meciuri:</b> '+val(c.match_days_available,0)+' · <b>Meciuri:</b> '+val(c.fixtures_found,0)+'<br><b>Meciuri analizabile:</b> '+val(c.fixtures_analyzed,0)+' · <b>Selecții:</b> '+val(c.selections,0)+'<br><b>Zile cu selecție:</b> '+val(c.days_with_selection,0)+(c.full_requested_window?'':'<br><span class="warn">ATENȚIE: datasetul nu acoperă integral perioada cerută.</span>')+'</div>';h+='<h2>Ultimele bilete</h2>';h+=(b.recent_tickets||[]).map(t=>'<div class="card"><small>'+t.date+' · '+t.legs+' selecții</small><br><b>Cotă '+t.odds+' · <span class="'+(t.won?'good':'bad')+'">'+(t.won?'CÂȘTIGAT':'PIERDUT')+'</span></b><br>'+t.selections.map(s=>s.match+': '+s.market+' @'+s.odds+' '+(s.won?'✓':'✗')).join('<br>')+'</div>').join('');if(!b.tickets)h+='<div class="card warn">Nu s-au putut construi bilete suficient de apropiate de COTA '+target+' în această perioadă.</div>';o.innerHTML=h}catch(e){o.innerHTML='<div class="card warn">Eroare backtest COTA '+target+': '+e.message+'</div>'}}'''
-    html = html.replace('</script>', js + '</script>', 1)
-    return HTMLResponse(html)
+@app.get('/',response_class=HTMLResponse)
+def home():
+    return HTMLResponse('''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>COTA 10</title><style>body{font-family:system-ui;background:#0b0f14;color:#fff;margin:0;padding:22px}main{max-width:900px;margin:auto}.card{background:#151b23;border:1px solid #29313d;border-radius:16px;padding:18px;margin:14px 0}.targets{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:12px}button{background:#35c46a;border:0;border-radius:12px;padding:15px 10px;font-weight:900;font-size:16px}input{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;border:1px solid #394453;background:#0b0f14;color:white}small{color:#9ba8b7}.prob{font-size:22px;font-weight:800}.warn{color:#ffcc66}.tag{display:inline-block;padding:4px 8px;border-radius:8px;background:#263241;margin:4px}.value{background:#174a32;color:#76f0aa}.hero{font-size:13px;color:#9ba8b7;margin-top:4px}</style></head><body><main><h1>COTA 10</h1><p>Alege cota. Motorul caută automat în intervalul potrivit și prioritizează selecțiile cu probabilitatea cea mai mare.</p><div class="card"><label>De la data</label><input id="d" type="date"><div class="targets"><button onclick="go(1.5)">COTA 1.50<div class="hero">1 zi</div></button><button onclick="go(5)">COTA 5<div class="hero">max. 2 zile</div></button><button onclick="go(10)">COTA 10<div class="hero">max. 4 zile</div></button><button onclick="go(100)">COTA 100<div class="hero">max. 7 zile</div></button></div></div><div id="out"></div><script>const val=(v,f='—')=>(v===undefined||v===null)?f:v;d.value=new Date().toISOString().slice(0,10);async function go(target){out.innerHTML='<p>Analizez COTA '+target+'...</p>';try{let r=await fetch('/api/analyze?day='+d.value+'&target='+target),x=await r.json();if(!r.ok)throw Error(x.detail||'Eroare');let h='<div class="card"><b>COTA '+target+' · '+x.analyzed+' meciuri analizate</b><br><small>Interval '+x.date+' → '+x.period_end+' · '+x.days+' '+(x.days==1?'zi':'zile')+' · '+x.api_fixtures+' meciuri primite din API</small></div>';if(x.suggested_combo){h+='<h2>Bilet recomandat</h2><div class="card"><div class="prob">Cotă combinată '+x.suggested_combo.combined_odds+'</div><small>Probabilitate comună estimată '+val(x.suggested_combo.estimated_joint_probability)+'%</small><br><br>'+x.suggested_combo.matches.map(m=>'<b>'+m.home+' – '+m.away+'</b><br>'+m.selection+' · '+m.probability+'% @'+m.odds+(m.kickoff?'<br><small>'+new Date(m.kickoff).toLocaleString('ro-RO')+'</small>':'')).join('<br><br>')+'</div>'}else h+='<div class="card warn"><b>Nu am construit COTA '+target+'.</b> În intervalul acesta nu sunt suficiente selecții care trec filtrele de siguranță.</div>';h+='<h2>Analiza multi-piață</h2>';for(let m of x.ranking){let b=m.best_market;h+='<div class="card"><small>'+m.league+(m.kickoff?' · '+new Date(m.kickoff).toLocaleString('ro-RO'):'')+'</small><h3>'+m.home+' – '+m.away+'</h3><div class="prob">'+b.market+' · '+b.probability+'%'+(b.bookmaker_odds?' @'+b.bookmaker_odds:'')+'</div><small>xG '+m.home_xg+' - '+m.away_xg+' · încredere '+m.confidence+'</small><div>'+m.markets.map(q=>'<span class="tag '+(q.value?'value':'')+'">'+q.market+' '+q.probability+'%'+(q.bookmaker_odds?' @'+q.bookmaker_odds:'')+'</span>').join('')+'</div></div>'}if(x.analysis_errors&&x.analysis_errors.length)h+='<div class="card warn"><small>'+x.analysis_errors.length+' meciuri nu au putut fi analizate complet.</small></div>';out.innerHTML=h}catch(e){out.innerHTML='<div class="card warn">'+e.message+'</div>'}}</script></main></body></html>''')
