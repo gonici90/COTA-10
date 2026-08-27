@@ -7,7 +7,7 @@ import market_engine
 from auto_data import router as data_router
 
 
-app = FastAPI(title="COTA 10", version="8.0")
+app = FastAPI(title="Analiza Cota AI", version="8.0")
 app.include_router(data_router)
 
 WINDOWS = {1.5: 1, 5.0: 2, 10.0: 4, 100.0: 7}
@@ -41,7 +41,7 @@ def home():
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#07110d">
-<title>COTA 10 • Analytics</title>
+<title>Analiza Cota AI • Analytics</title>
 <style>
 :root{
  --bg:#07110d;--panel:#0d1b15;--panel2:#10241b;--line:#1c382b;
@@ -175,8 +175,8 @@ details[open] summary:after{content:" −"}
 <main class="shell">
  <header class="topbar">
   <div class="brand">
-   <div class="logo">C10</div>
-   <div><div class="brand-title">COTA 10</div><div class="brand-sub">Football Intelligence</div></div>
+   <div class="logo">AI</div>
+   <div><div class="brand-title">Analiza Cota AI</div><div class="brand-sub">AI Football Intelligence</div></div>
   </div>
   <div class="engine">ENGINE v8.0</div>
  </header>
@@ -200,7 +200,7 @@ details[open] summary:after{content:" −"}
  </section>
 
  <div id="out"></div>
- <div class="footer">COTA 10 • engine v8.0 • 5DollarFootballAPI + Bet365</div>
+ <div class="footer">Analiza Cota AI • engine v8.0 • 5DollarFootballAPI + Bet365</div>
 </main>
 
 <script>
