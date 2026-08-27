@@ -8,3 +8,5 @@ services:
     envVars:
       - key: FIVEDOLLAR_API_KEY
         sync: false
+      - key: THE_ODDS_API_KEY
+        sync: false
