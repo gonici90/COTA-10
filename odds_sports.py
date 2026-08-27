@@ -225,7 +225,7 @@ def _median(values):
 
 def _pair_probs(outcomes):
     prices = [_safe_float(x.get("price")) for x in outcomes]
-    if len(prices) != 2 or any(not p or p <= 1.0 for p in prices):
+    if len(prices) not in (2, 3) or any(not p or p <= 1.0 for p in prices):
         return None
     inv = [1.0 / p for p in prices]
     z = sum(inv)
