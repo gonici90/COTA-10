@@ -10,62 +10,59 @@ app=core.app
 core._cacheable=lambda path:path.startswith('/matches')
 
 def safer_build_combo(rows,target):
+    """Target-driven optimiser: one selection per fixture, maximise joint probability near requested odds."""
     target=float(target)
-    high=target>=50
     candidates=[]
     for r in rows:
-        good=[]
+        opts=[]
         for p in r.get('markets',[]):
-            odd=p.get('bookmaker_odds')
-            if not odd or p.get('suspicious'):continue
-            odd=float(odd);prob=float(p.get('probability',0))/100
-            if high:
-                # COTA 100: many moderate legs, but adapt to the number of fixtures
-                # that actually have usable odds. Do not require 14 legs when only
-                # e.g. 13 matches have markets available.
-                minp=.72 if odd<1.25 else .68 if odd<1.35 else .64 if odd<1.45 else .60 if odd<1.55 else .58
-                allowed=1.05<=odd<=1.65
+            try:
+                odd=float(p.get('bookmaker_odds') or 0)
+                prob=float(p.get('probability') or 0)/100.0
+            except (TypeError,ValueError):
+                continue
+            if p.get('suspicious') or odd<=1.01 or prob<=0:continue
+            # Keep a broad but sane universe. The optimiser, not hard-coded leg counts,
+            # decides how many selections are required for the requested target.
+            if target>=50:
+                if not (1.03<=odd<=2.20 and prob>=.52):continue
+            elif target>=10:
+                if not (1.03<=odd<=2.80 and prob>=.54):continue
+            elif target>=5:
+                if not (1.03<=odd<=3.20 and prob>=.56):continue
             else:
-                minp=.70 if odd<1.20 else .66 if odd<1.35 else .62 if odd<1.60 else .58
-                allowed=1.04<=odd<=3.50
-            if allowed and prob>=minp:
-                good.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'combo_prob':prob})
-        if good:
-            # Exactly one leg per match; probability is the primary objective.
-            candidates.append(max(good,key=lambda x:(x['combo_prob'],x.get('recommendation_score',0),-x['bookmaker_odds'])))
+                if not (1.03<=odd<=3.50 and prob>=.58):continue
+            opts.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'combo_prob':prob})
+        if opts:
+            # Keep several alternatives per fixture. A slightly less probable 1.25 can
+            # be preferable globally to a 1.08 if it reaches the target with fewer risky legs.
+            opts.sort(key=lambda x:(x['combo_prob'],x.get('recommendation_score',0)) ,reverse=True)
+            candidates.append(opts[:6])
 
-    def search(max_odd,min_legs,max_legs,lo,hi):
-        pool=[x for x in candidates if x['bookmaker_odds']<=max_odd]
-        if len(pool)<min_legs:return None
-        max_legs=min(max_legs,len(pool))
-        states={(0,0):(1.0,1.0,[])}
-        for x in pool:
-            nxt=dict(states)
-            for (legs,_),(odd,joint,path) in states.items():
-                if legs>=max_legs:continue
-                no=odd*x['bookmaker_odds']
+    if not candidates:return None
+
+    lo,hi=(.95,1.08) if target>=50 else (.92,1.08)
+    max_legs=min(len(candidates),40 if target>=50 else 20)
+    # DP buckets by log-odds. State stores the path with highest joint probability.
+    states={(0,0):(1.0,1.0,[])}
+    scale=260
+    for fixture_opts in candidates:
+        nxt=dict(states)  # skipping this fixture is allowed
+        for (legs,_),(cur_odd,joint,path) in list(states.items()):
+            if legs>=max_legs:continue
+            for x in fixture_opts:
+                no=cur_odd*x['bookmaker_odds']
                 if no>target*hi:continue
                 nj=joint*x['combo_prob'];nl=legs+1
-                bucket=round(math.log(max(no,1.0))*180)
+                bucket=round(math.log(max(no,1.0))*scale)
                 key=(nl,bucket);old=nxt.get(key)
                 if old is None or nj>old[1]:nxt[key]=(no,nj,path+[x])
-            states=nxt
-        valid=[v for (legs,_),v in states.items() if min_legs<=legs<=max_legs and target*lo<=v[0]<=target*hi]
-        if not valid:return None
-        return max(valid,key=lambda v:(v[1],-abs(math.log(v[0]/target)),len(v[2])))
+        states=nxt
 
-    if high:
-        # Adapt the minimum number of legs to the usable pool. Prefer 12-20,
-        # then 10+, and only as a last resort 8+; odds per leg remain capped.
-        n=len(candidates)
-        best=None
-        if n>=12:best=search(1.50,12,20,.95,1.08)
-        if best is None and n>=10:best=search(1.55,10,20,.95,1.08)
-        if best is None and n>=8:best=search(1.65,8,20,.95,1.08)
-    else:
-        best=search(3.50,1,12,.92,1.08)
-    if not best:return None
-    odd,joint,path=best
+    valid=[v for (legs,_),v in states.items() if legs>0 and target*lo<=v[0]<=target*hi]
+    if not valid:return None
+    # Safety first. Closeness to requested odds is only the tie-breaker.
+    odd,joint,path=max(valid,key=lambda v:(v[1],-abs(math.log(v[0]/target)),-len(v[2])))
     return {'combined_odds':round(odd,2),'estimated_joint_probability':round(joint*100,1),'matches':[{'home':x['home'],'away':x['away'],'kickoff':x.get('kickoff'),'selection':x['market'],'probability':x['probability'],'odds':x['bookmaker_odds'],'ev':x.get('ev'),'score':x.get('recommendation_score')} for x in path]}
 
 market_engine.build_combo=safer_build_combo
@@ -81,4 +78,4 @@ _old_home=next((r for r in app.router.routes if getattr(r,'path',None)=='/'),Non
 if _old_home:app.router.routes.remove(_old_home)
 @app.get('/',response_class=HTMLResponse)
 def home():
- return HTMLResponse('''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>COTA 10</title><style>body{font-family:system-ui;background:#0b0f14;color:#fff;margin:0;padding:22px}main{max-width:900px;margin:auto}.card{background:#151b23;border:1px solid #29313d;border-radius:16px;padding:18px;margin:14px 0}.targets{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}button{background:#35c46a;border:0;border-radius:12px;padding:15px 10px;font-weight:900;font-size:16px}input{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;border:1px solid #394453;background:#0b0f14;color:white}small{color:#9ba8b7}.prob{font-size:22px;font-weight:800}.warn{color:#ffcc66}.tag{display:inline-block;padding:4px 8px;border-radius:8px;background:#263241;margin:4px}.value{background:#174a32;color:#76f0aa}.hero{font-size:13px;color:#9ba8b7}</style></head><body><main><h1>COTA 10</h1><p>Alege cota. Motorul verifică toate meciurile disponibile din interval și caută combinația cu probabilitatea estimată cea mai mare.</p><div class="card"><label>De la data</label><input id="d" type="date"><div class="targets"><button onclick="go(1.5)">COTA 1.50<div class="hero">1 zi</div></button><button onclick="go(5)">COTA 5<div class="hero">max. 2 zile</div></button><button onclick="go(10)">COTA 10<div class="hero">max. 4 zile</div></button><button onclick="go(100)">COTA 100<div class="hero">max. 7 zile</div></button></div></div><div id="out"></div><script>d.value=new Date().toISOString().slice(0,10);async function go(t){out.innerHTML='<p>Analizez...</p>';try{let r=await fetch('/api/analyze?day='+d.value+'&target='+t),x=await r.json();if(!r.ok)throw Error(x.detail||'Eroare');let h='<div class="card"><b>COTA '+t+' · '+x.analyzed+' meciuri analizate</b><br><small>'+x.date+' → '+x.period_end+' · '+x.api_fixtures+' primite · '+x.attempted+' verificate · '+x.without_usable_odds+' fără cote · '+x.analysis_errors.length+' erori</small></div>';if(x.suggested_combo){let c=x.suggested_combo;h+='<h2>Bilet recomandat</h2><div class="card"><div class="prob">Cotă combinată '+c.combined_odds+'</div><small>Probabilitate comună estimată '+c.estimated_joint_probability+'% · '+c.matches.length+' selecții</small><br><br>'+c.matches.map(m=>'<b>'+m.home+' – '+m.away+'</b><br>'+m.selection+' · '+m.probability+'% @'+m.odds).join('<br><br>')+'</div>'}else h+='<div class="card warn"><b>Nu există momentan o combinație suficient de sigură pentru COTA '+t+'.</b> Motorul nu forțează selecții slabe doar ca să atingă cota.</div>';h+='<h2>Analiza multi-piață</h2>';for(let m of x.ranking){let b=m.best_market;h+='<div class="card"><small>'+m.league+(m.kickoff?' · '+new Date(m.kickoff).toLocaleString('ro-RO'):'')+'</small><h3>'+m.home+' – '+m.away+'</h3><div class="prob">'+b.market+' · '+b.probability+'% @'+b.bookmaker_odds+'</div><div>'+m.markets.map(q=>'<span class="tag '+(q.value?'value':'')+'">'+q.market+' '+q.probability+'% @'+q.bookmaker_odds+'</span>').join('')+'</div></div>'}out.innerHTML=h}catch(e){out.innerHTML='<div class="card warn">'+e.message+'</div>'}}</script></main></body></html>''')
+ return HTMLResponse('''<!doctype html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>COTA 10</title><style>body{font-family:system-ui;background:#0b0f14;color:#fff;margin:0;padding:22px}main{max-width:900px;margin:auto}.card{background:#151b23;border:1px solid #29313d;border-radius:16px;padding:18px;margin:14px 0}.targets{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}button{background:#35c46a;border:0;border-radius:12px;padding:15px 10px;font-weight:900;font-size:16px}input{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;border:1px solid #394453;background:#0b0f14;color:white}small{color:#9ba8b7}.prob{font-size:22px;font-weight:800}.warn{color:#ffcc66}.tag{display:inline-block;padding:4px 8px;border-radius:8px;background:#263241;margin:4px}.value{background:#174a32;color:#76f0aa}.hero{font-size:13px;color:#9ba8b7}</style></head><body><main><h1>COTA 10</h1><p>Alege cota. Motorul verifică toate meciurile disponibile din interval și caută combinația cu probabilitatea estimată cea mai mare.</p><div class="card"><label>De la data</label><input id="d" type="date"><div class="targets"><button onclick="go(1.5)">COTA 1.50<div class="hero">1 zi</div></button><button onclick="go(5)">COTA 5<div class="hero">max. 2 zile</div></button><button onclick="go(10)">COTA 10<div class="hero">max. 4 zile</div></button><button onclick="go(100)">COTA 100<div class="hero">max. 7 zile</div></button></div></div><div id="out"></div><script>d.value=new Date().toISOString().slice(0,10);async function go(t){out.innerHTML='<p>Analizez...</p>';try{let r=await fetch('/api/analyze?day='+d.value+'&target='+t),x=await r.json();if(!r.ok)throw Error(x.detail||'Eroare');let h='<div class="card"><b>COTA '+t+' · '+x.analyzed+' meciuri analizate</b><br><small>'+x.date+' → '+x.period_end+' · '+x.api_fixtures+' primite · '+x.attempted+' verificate · '+x.without_usable_odds+' fără cote · '+x.analysis_errors.length+' erori</small></div>';if(x.suggested_combo){let c=x.suggested_combo;h+='<h2>Bilet recomandat</h2><div class="card"><div class="prob">Cotă combinată '+c.combined_odds+'</div><small>Probabilitate comună estimată '+c.estimated_joint_probability+'% · '+c.matches.length+' selecții</small><br><br>'+c.matches.map(m=>'<b>'+m.home+' – '+m.away+'</b><br>'+m.selection+' · '+m.probability+'% @'+m.odds).join('<br><br>')+'</div>'}else h+='<div class="card warn"><b>Nu există momentan o combinație eligibilă pentru COTA '+t+'.</b> Au fost testate matematic selecțiile disponibile, maximum una din fiecare meci.</div>';h+='<h2>Analiza multi-piață</h2>';for(let m of x.ranking){let b=m.best_market;h+='<div class="card"><small>'+m.league+(m.kickoff?' · '+new Date(m.kickoff).toLocaleString('ro-RO'):'')+'</small><h3>'+m.home+' – '+m.away+'</h3><div class="prob">'+b.market+' · '+b.probability+'% @'+b.bookmaker_odds+'</div><div>'+m.markets.map(q=>'<span class="tag '+(q.value?'value':'')+'">'+q.market+' '+q.probability+'% @'+q.bookmaker_odds+'</span>').join('')+'</div></div>'}out.innerHTML=h}catch(e){out.innerHTML='<div class="card warn">'+e.message+'</div>'}}</script></main></body></html>''')
