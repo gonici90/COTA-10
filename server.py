@@ -1,17 +1,27 @@
 from datetime import date
+
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
+
 import market_engine
 from auto_data import router as data_router
 
-app = FastAPI(title="COTA 10", version="7.0")
+
+app = FastAPI(title="COTA 10", version="8.0")
 app.include_router(data_router)
 
 WINDOWS = {1.5: 1, 5.0: 2, 10.0: 4, 100.0: 7}
 
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "7.0", "provider": "5DollarFootballAPI + Bet365"}
+    return {
+        "status": "ok",
+        "version": "8.0",
+        "provider": "5DollarFootballAPI + Bet365",
+        "optimizer": "safety-first-global",
+    }
+
 
 @app.get("/api/analyze")
 def analyze_multimarket(
@@ -20,6 +30,7 @@ def analyze_multimarket(
 ):
     supported = min(WINDOWS, key=lambda x: abs(x - target))
     return market_engine.analyze_period(day, supported, WINDOWS[supported], 200)
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -39,11 +50,12 @@ input{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;border:1px
 small{color:#9ba8b7}.prob{font-size:22px;font-weight:800}.warn{color:#ffcc66}
 .tag{display:inline-block;padding:4px 8px;border-radius:8px;background:#263241;margin:4px}
 .value{background:#174a32;color:#76f0aa}.hero{font-size:13px;color:#9ba8b7}.good{color:#55df8b}
+.version{opacity:.55;text-align:center;margin:24px 0;font-size:12px}
 </style>
 </head>
 <body><main>
 <h1>COTA 10</h1>
-<p>Motorul verifică toate meciurile cu cote Bet365 din interval și construiește global combinația cea mai potrivită pentru ținta aleasă.</p>
+<p>Motorul verifică toate meciurile cu cote Bet365 din interval și construiește global combinația cu probabilitatea conservatoare estimată cea mai mare în jurul țintei alese.</p>
 <div class="card">
 <label>De la data</label><input id="d" type="date">
 <div class="targets">
@@ -53,6 +65,7 @@ small{color:#9ba8b7}.prob{font-size:22px;font-weight:800}.warn{color:#ffcc66}
 <button onclick="go(100)">COTA 100<div class="hero">max. 7 zile</div></button>
 </div></div>
 <div id="out"></div>
+<div class="version">engine v8.0</div>
 <script>
 function localDate(){
  const x=new Date(), y=x.getFullYear(), m=String(x.getMonth()+1).padStart(2,'0'), d=String(x.getDate()).padStart(2,'0');
@@ -70,7 +83,7 @@ async function go(t){
   if(x.suggested_combo){
     const c=x.suggested_combo;
     const status=c.target_met?'Ținta atinsă':'Cea mai bună variantă apropiată';
-    h+='<h2>Bilet recomandat</h2><div class="card"><div class="prob">Cotă combinată '+c.combined_odds+'</div><small class="'+(c.target_met?'good':'warn')+'">'+status+' · probabilitate comună estimată '+c.estimated_joint_probability+'% · '+c.matches.length+' selecții · cotă medie/selecție '+c.average_leg_odds+'</small><br><br>'+c.matches.map(m=>'<b>'+m.home+' – '+m.away+'</b><br>'+m.selection+' · '+m.probability+'% @'+m.odds+(m.kickoff?'<br><small>'+new Date(m.kickoff).toLocaleString('ro-RO')+'</small>':'')).join('<br><br>')+'</div>';
+    h+='<h2>Bilet recomandat</h2><div class="card"><div class="prob">Cotă combinată '+c.combined_odds+'</div><small class="'+(c.target_met?'good':'warn')+'">'+status+' · probabilitate comună conservatoare estimată '+c.estimated_joint_probability+'% · '+c.matches.length+' selecții · cotă medie/selecție '+c.average_leg_odds+' · cotă maximă/selecție '+c.max_leg_odds+'</small><br><br>'+c.matches.map(m=>'<b>'+m.home+' – '+m.away+'</b><br>'+m.selection+' · '+m.probability+'% @'+m.odds+(m.kickoff?'<br><small>'+new Date(m.kickoff).toLocaleString('ro-RO')+'</small>':'')).join('<br><br>')+'</div>';
   }else{
     h+='<div class="card warn"><b>Nu există o combinație matematică suficient de apropiată de COTA '+t+'.</b><br><small>Meciuri candidate: '+(dg.candidate_matches??0)+' · selecții candidate: '+(dg.candidate_selections??0)+' · cea mai apropiată cotă găsită: '+(dg.closest_reachable_odds??'—')+'</small></div>';
   }
