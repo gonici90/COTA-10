@@ -35,20 +35,18 @@ def _stage(m):
     return m if any(k in m for k in ('home','away','over','under','draw','yes','no','line')) else None
 def _normalize_odds(data):
     if not isinstance(data,dict):return {}
-    # tolerate API envelopes at every level
     for k in ('data','response','result'):
         if isinstance(data.get(k),dict):data=data[k]
     books=data.get('bookmakers') or data.get('books') or []
     if isinstance(books,dict):books=list(books.values())
     if books:
-        b=next((x for x in books if str(x.get('slug') or x.get('name') or '').lower() in ('bet365','bet 365')),books[0])
-        return b.get('odds') or b.get('markets') or b
+        b=next((x for x in books if isinstance(x,dict) and str(x.get('slug') or x.get('name') or '').lower() in ('bet365','bet 365')),books[0])
+        return b.get('odds') or b.get('markets') or b if isinstance(b,dict) else {}
     return data.get('odds') or data.get('markets') or data
 
 def _odds_payload(fid):
+    if not fid:return {}
     if fid in _ODDS_CACHE:return _ODDS_CACHE[fid]
-    # endpoint is plan-supported one-fixture-at-a-time; do not pass bookmaker filter
-    # because some plan responses reject/filter it differently.
     raw=fd._get(f'/fixtures/{fid}/odds')
     odds=_normalize_odds(raw);_ODDS_CACHE[fid]=odds;return odds
 
@@ -56,21 +54,52 @@ def _recent(team_id,before,n=12):
     if not team_id:return []
     key=(team_id,int(before)//86400,n)
     if key in _RECENT_CACHE:return _RECENT_CACHE[key]
-    raw=fd._get(f'/teams/{team_id}/fixtures',{'status':'finished','end_time':before,'per_page':min(50,max(20,n*2))})
-    data=raw.get('data',raw) if isinstance(raw,dict) else raw
-    if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or []
-    else:rows=data or []
-    rows=[x for x in rows if (x.get('goals') or {}).get('home') is not None];rows.sort(key=lambda x:x.get('kickoff_ts') or 0,reverse=True);rows=rows[:n]
+    try:
+        raw=fd._get(f'/teams/{team_id}/fixtures',{'status':'finished','end_time':before,'per_page':min(50,max(20,n*2))})
+        data=raw.get('data',raw) if isinstance(raw,dict) else raw
+        if isinstance(data,dict):rows=data.get('fixtures') or data.get('data') or []
+        else:rows=data or []
+        rows=[x for x in rows if isinstance(x,dict) and _goals(x)[0] is not None];rows.sort(key=_kickoff_ts,reverse=True);rows=rows[:n]
+    except Exception:
+        rows=[]
     _RECENT_CACHE[key]=rows;return rows
+
+def _teams(m):
+    t=m.get('teams') or {}
+    if isinstance(t,dict) and (t.get('home') or t.get('away')):return t.get('home') or {},t.get('away') or {}
+    h=m.get('home_team') or m.get('home') or {};a=m.get('away_team') or m.get('away') or {}
+    if not isinstance(h,dict):h={'name':str(h)}
+    if not isinstance(a,dict):a={'name':str(a)}
+    return h,a
+def _team_id(t):return t.get('id') or t.get('team_id')
+def _kickoff_ts(m):
+    v=m.get('kickoff_ts') or m.get('timestamp') or m.get('start_time') or m.get('kickoff') or m.get('date')
+    if isinstance(v,(int,float)):return int(v)
+    if isinstance(v,str):
+        try:return int(float(v))
+        except:pass
+        try:return int(datetime.fromisoformat(v.replace('Z','+00:00')).timestamp())
+        except:pass
+    return int(datetime.now(timezone.utc).timestamp())
+def _goals(m):
+    g=m.get('goals') or m.get('score') or {}
+    if isinstance(g,dict):
+        hg=_num(g.get('home'));ag=_num(g.get('away'))
+        if hg is None and isinstance(g.get('fulltime'),dict):hg=_num(g['fulltime'].get('home'));ag=_num(g['fulltime'].get('away'))
+        return hg,ag
+    return None,None
 
 def _team_rates(tid,games):
     gf=ga=cf=ca=yf=ya=ws=0
     for i,m in enumerate(games):
-        teams=m.get('teams') or {};home=(teams.get('home') or {}).get('id')==tid;goals=m.get('goals') or {};corn=m.get('corners') or {};cards=m.get('cards') or {};hg,ag=_num(goals.get('home')),_num(goals.get('away'));hc,ac=_num(corn.get('home')),_num(corn.get('away'));hca,aca=cards.get('home') or {},cards.get('away') or {}
+        home,away=_teams(m);is_home=_team_id(home)==tid;hg,ag=_goals(m);corn=m.get('corners') or {};cards=m.get('cards') or {}
         if hg is None or ag is None:continue
-        hy=(_num(hca.get('yellow')) or 0)+2*(_num(hca.get('red')) or 0);ay=(_num(aca.get('yellow')) or 0)+2*(_num(aca.get('red')) or 0);w=.9**i;ws+=w;gf+=(hg if home else ag)*w;ga+=(ag if home else hg)*w
-        if hc is not None and ac is not None:cf+=(hc if home else ac)*w;ca+=(ac if home else hc)*w
-        yf+=(hy if home else ay)*w;ya+=(ay if home else hy)*w
+        hc,ac=_num(corn.get('home')),_num(corn.get('away'));hca,aca=cards.get('home') or {},cards.get('away') or {}
+        if not isinstance(hca,dict):hca={};
+        if not isinstance(aca,dict):aca={};
+        hy=(_num(hca.get('yellow')) or 0)+2*(_num(hca.get('red')) or 0);ay=(_num(aca.get('yellow')) or 0)+2*(_num(aca.get('red')) or 0);w=.9**i;ws+=w;gf+=(hg if is_home else ag)*w;ga+=(ag if is_home else hg)*w
+        if hc is not None and ac is not None:cf+=(hc if is_home else ac)*w;ca+=(ac if is_home else hc)*w
+        yf+=(hy if is_home else ay)*w;ya+=(ay if is_home else hy)*w
     if not ws:return {'n':0,'gf':1.25,'ga':1.25,'cf':5,'ca':5,'cards_for':2,'cards_against':2}
     return {'n':len(games),'gf':gf/ws,'ga':ga/ws,'cf':cf/ws,'ca':ca/ws,'cards_for':yf/ws,'cards_against':ya/ws}
 def _add(out,name,p,odd,src):
@@ -79,7 +108,7 @@ def _add(out,name,p,odd,src):
     p=max(.02,min(.98,p));imp=1/odd;cal=max(.03,min(.97,.62*p+.38*imp));ev=(cal*odd-1)*100
     out.append({'market':name,'probability':round(cal*100,1),'raw_probability':round(p*100,1),'bookmaker_odds':round(odd,2),'fair_odds':round(1/cal,2),'ev':round(ev,1),'safe':cal>=.60,'value':ev>=2,'suspicious':abs(p-imp)>.30,'source':src,'recommendation_score':round(cal*100+max(-5,min(10,ev))*.15,1)})
 def analyze_fixture(f):
-    teams=f.get('teams') or {};h=teams.get('home') or {};a=teams.get('away') or {};fid=f.get('id');ts=f.get('kickoff_ts') or int(datetime.now(timezone.utc).timestamp());hr=_team_rates(h.get('id'),_recent(h.get('id'),ts));ar=_team_rates(a.get('id'),_recent(a.get('id'),ts));lh=max(.15,(hr['gf']+ar['ga'])/2*1.06);la=max(.15,(ar['gf']+hr['ga'])/2*.96);hp,dp,ap,g=_score_probs(lh,la);odds=_odds_payload(fid);picks=[]
+    h,a=_teams(f);fid=f.get('id') or f.get('fixture_id');ts=_kickoff_ts(f);hid,aid=_team_id(h),_team_id(a);hr=_team_rates(hid,_recent(hid,ts));ar=_team_rates(aid,_recent(aid,ts));lh=max(.15,(hr['gf']+ar['ga'])/2*1.06);la=max(.15,(ar['gf']+hr['ga'])/2*.96);hp,dp,ap,g=_score_probs(lh,la);odds=_odds_payload(fid);picks=[]
     m=_stage(odds.get('1x2') or odds.get('match_winner'))
     if m:_add(picks,'1',hp,m.get('home'),'Bet365 1X2');_add(picks,'X',dp,m.get('draw'),'Bet365 1X2');_add(picks,'2',ap,m.get('away'),'Bet365 1X2')
     m=_stage(odds.get('asian_handicap') or odds.get('asian'))
@@ -90,8 +119,9 @@ def analyze_fixture(f):
     for keys,label,lam in specs:
         market=next((odds.get(k) for k in keys if odds.get(k)),None);m=_stage(market);line=_num(m.get('line')) if m else None
         if line is not None:_add(picks,('Over ' if label=='Goals' else label+' Over ')+f'{line:g}',_total_prob(lam,line,True),m.get('over'),'Bet365 '+label);_add(picks,('Under ' if label=='Goals' else label+' Under ')+f'{line:g}',_total_prob(lam,line,False),m.get('under'),'Bet365 '+label)
-    picks.sort(key=lambda x:(not x['suspicious'],x['safe'],x['recommendation_score']),reverse=True);usable=[x for x in picks if not x['suspicious']];best=usable[0] if usable else (picks[0] if picks else None)
-    return {'fixture_id':fid,'kickoff':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'league':(f.get('league') or {}).get('name',''),'country':'','home':h.get('name','?'),'away':a.get('name','?'),'home_xg':round(lh,2),'away_xg':round(la,2),'confidence':'ridicată' if min(hr['n'],ar['n'])>=8 else 'medie','markets':picks,'best_market':best,'best_value':next((x for x in usable if x['value']),None),'home_last':hr['n'],'away_last':ar['n'],'odds_markets':list(odds.keys())}
+    picks.sort(key=lambda x:(not x['suspicious'],x['safe'],x['recommendation_score']),reverse=True);usable=[x for x in picks if not x['suspicious']];best=usable[0] if usable else (picks[0] if picks else None);league=f.get('league') or {}
+    if not isinstance(league,dict):league={'name':str(league)}
+    return {'fixture_id':fid,'kickoff':datetime.fromtimestamp(ts,timezone.utc).isoformat(),'league':league.get('name',''),'country':'','home':h.get('name','?'),'away':a.get('name','?'),'home_xg':round(lh,2),'away_xg':round(la,2),'confidence':'ridicată' if min(hr['n'],ar['n'])>=8 else 'medie','markets':picks,'best_market':best,'best_value':next((x for x in usable if x['value']),None),'home_last':hr['n'],'away_last':ar['n'],'odds_markets':list(odds.keys()) if isinstance(odds,dict) else []}
 
 def _day_fixtures(day):
     start=int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp());out=[];seen=set()
@@ -102,15 +132,15 @@ def _day_fixtures(day):
         else:rows=data or [];pag={}
         new=[]
         for x in rows:
-            fid=x.get('id')
-            if fid not in seen:seen.add(fid);new.append(x)
+            if not isinstance(x,dict):continue
+            fid=x.get('id') or x.get('fixture_id')
+            key=fid or (_teams(x)[0].get('name'),_teams(x)[1].get('name'),_kickoff_ts(x))
+            if key not in seen:seen.add(key);new.append(x)
         out.extend(new)
         if not rows or not new or (not pag.get('has_more') and len(rows)<50):break
     return out
 
 def build_combo(rows,target):
-    # One best selection per fixture. Dynamic programming avoids the previous
-    # combinatorial explosion and searches all analyzed matches.
     candidates=[]
     for r in rows:
         good=[]
@@ -118,18 +148,15 @@ def build_combo(rows,target):
             odd=p.get('bookmaker_odds');prob=p.get('probability',0)/100
             if not odd:continue
             minp=.70 if odd<1.20 else .66 if odd<1.35 else .62 if odd<1.60 else .58
-            if 1.05<=odd<=4.0 and prob>=minp and not p.get('suspicious'):
-                good.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'match':r['home']+' - '+r['away'],'combo_prob':prob})
+            if 1.05<=odd<=4.0 and prob>=minp and not p.get('suspicious'):good.append({**p,'home':r['home'],'away':r['away'],'kickoff':r.get('kickoff'),'combo_prob':prob})
         if good:candidates.append(max(good,key=lambda x:(x['probability'],x['recommendation_score'])))
-    # state keyed by rounded log-odds; retain highest joint probability path
     states={0:(1.0,1.0,[])}
     for x in candidates:
         nxt=dict(states)
         for _,(odd,joint,path) in states.items():
             no=odd*x['bookmaker_odds']
             if no>target*1.25:continue
-            nj=joint*x['combo_prob'];key=round(math.log(max(no,1.0))*80)
-            old=nxt.get(key)
+            nj=joint*x['combo_prob'];key=round(math.log(max(no,1.0))*80);old=nxt.get(key)
             if old is None or nj>old[1]:nxt[key]=(no,nj,path+[x])
         states=nxt
     valid=[v for v in states.values() if v[2] and target*.88<=v[0]<=target*1.15]
@@ -145,8 +172,9 @@ def analyze_period(day,target=10,days=1,limit=200):
         try:
             r=analyze_fixture(f)
             if r['best_market']:rows.append(r)
-            else:no_odds.append({'fixture':f.get('id'),'match':(f.get('teams',{}).get('home',{}).get('name','?')+' - '+f.get('teams',{}).get('away',{}).get('name','?')),'odds_markets':r.get('odds_markets',[])})
-        except Exception as e:errors.append({'fixture':f.get('id'),'error':str(e)[:220]})
+            else:no_odds.append({'fixture':f.get('id') or f.get('fixture_id'),'match':r['home']+' - '+r['away'],'odds_markets':r.get('odds_markets',[])})
+        except Exception as e:
+            h,a=_teams(f);errors.append({'fixture':f.get('id') or f.get('fixture_id'),'match':h.get('name','?')+' - '+a.get('name','?'),'error':type(e).__name__+': '+str(e)[:220]})
     rows.sort(key=lambda x:x['best_market']['recommendation_score'],reverse=True)
     return {'date':day,'days':days,'period_end':(start+timedelta(days=days-1)).isoformat(),'provider':'5DollarFootballAPI + Bet365','fixtures_by_day':by_day,'api_fixtures':len(fs),'eligible':len(fs),'attempted':min(len(fs),attempt),'analyzed':len(rows),'without_usable_odds':len(no_odds),'no_odds_examples':no_odds[:20],'analysis_errors':errors[:20],'ranking':rows,'suggested_combo':build_combo(rows,float(target))}
 def analyze_day(day,target=10,limit=12):return analyze_period(day,target,1,limit)
