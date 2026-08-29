@@ -3,8 +3,8 @@
 Goals:
 - avoid one single ~2.00 straight 1X2 bet being treated as a "safe ticket";
 - use at least two lower-priced legs for normal backtest targets;
-- prefer non-1X2 markets when their estimated safety is comparable;
-- deep-fetch full Bet365 markets for a small historical shortlist;
+- for low total odds, test genuinely non-1X2 tickets instead of a forced 1X2+other mix;
+- deep-fetch full Bet365 markets for a wider historical shortlist;
 - recover a second page of historical fixtures when a day has >50 matches.
 
 The deep requests are cached. First 60-day runs can therefore take longer, but later
@@ -15,7 +15,10 @@ import math
 from datetime import datetime, timedelta, timezone
 
 
-DETAILS_PER_DAY = 4
+# Four deep fixtures/day was too restrictive: with two-leg tickets it mechanically
+# produced many 1X2 + non-1X2 pairs and too many NO_TICKET days. Eight keeps the
+# Pro cost bounded while giving the optimiser a real multi-market pool.
+DETAILS_PER_DAY = 8
 
 
 def install(bt, engine, fd):
@@ -164,20 +167,27 @@ def install(bt, engine, fd):
 
     def _quality_combo(rows, target):
         target = max(1.05, float(target))
-        # A target around 2.00 should be a ticket of safer legs, not one ~2.00 straight pick.
         min_legs = 2 if target >= 1.45 else 1
         max_legs = 5 if target <= 5 else 7
+
+        # At target 2.00 the old 60% / 1.60 gate plus max-one-1X2 rule left only
+        # 16 tickets in 60 days. Widen the non-solo pool without allowing wild legs.
         if target <= 2.5:
-            max_leg_odd, min_prob = 1.60, 0.60
+            max_leg_odd, min_prob = 1.70, 0.58
         elif target <= 5:
-            max_leg_odd, min_prob = 1.85, 0.58
+            max_leg_odd, min_prob = 1.90, 0.56
         elif target <= 10:
-            max_leg_odd, min_prob = 2.05, 0.56
+            max_leg_odd, min_prob = 2.10, 0.54
         else:
-            max_leg_odd, min_prob = 2.25, 0.53
-        min_leg_odd = 1.10
+            max_leg_odd, min_prob = 2.30, 0.52
+
+        # For low requested total odds we explicitly test non-solo construction.
+        # Above 3.00, at most one straight result may be used if it is genuinely best.
+        max_solists = 0 if target <= 3.0 else 1
+
+        min_leg_odd = 1.08
         preferred_low, preferred_high = target * 0.97, target * 1.05
-        fallback_low, fallback_high = target * 0.92, target * 1.08
+        fallback_low, fallback_high = target * 0.90, target * 1.10
 
         fixtures = []
         for row in rows:
@@ -191,8 +201,10 @@ def install(bt, engine, fd):
                 if pick.get("suspicious") or not (min_leg_odd <= odd <= max_leg_odd) or prob < min_prob:
                     continue
                 kind = _market_kind(pick.get("market"))
-                # Small preference only: non-1X2 wins ties/near-ties, but a clearly safer 1X2
-                # selection can still be used. This avoids artificial market diversification.
+                if kind == "1X2" and max_solists == 0:
+                    continue
+                # Non-1X2 is the point of the low-odds quality test. Corners/cards get
+                # a tiny uncertainty haircut; goals/AH/BTTS stay neutral.
                 reliability = 0.985 if kind == "1X2" else (0.995 if kind in {"CORNERS", "CARDS"} else 1.0)
                 opts.append({
                     **pick,
@@ -207,7 +219,7 @@ def install(bt, engine, fd):
                 })
             if opts:
                 opts.sort(key=lambda x: (x["quality_prob"], x.get("recommendation_score", 0), -x["odd"]), reverse=True)
-                fixtures.append(opts[:8])
+                fixtures.append(opts[:10])
 
         diag = {
             "candidate_matches": len(fixtures),
@@ -215,11 +227,12 @@ def install(bt, engine, fd):
             "max_legs": max_legs,
             "max_leg_odds": max_leg_odd,
             "min_probability": round(min_prob * 100, 1),
+            "max_1x2_legs": max_solists,
+            "deep_fixtures_per_day": DETAILS_PER_DAY,
         }
         if not fixtures:
             return None, diag
 
-        # odds bucket, legs, number of straight 1X2 picks -> best state
         scale = 150
         states = {(0, 0, 0): (1.0, 1.0, 1.0, [], 1.0)}
         for opts in fixtures:
@@ -229,9 +242,7 @@ def install(bt, engine, fd):
                     continue
                 for x in opts:
                     solists = sum(1 for p in path if p["kind"] == "1X2") + (1 if x["kind"] == "1X2" else 0)
-                    # With multi-leg tickets, do not let every leg become a straight result pick.
-                    # One 1X2 leg is allowed; the rest should come from other priced markets.
-                    if min_legs >= 2 and solists > 1:
+                    if solists > max_solists:
                         continue
                     no = cur_odd * x["odd"]
                     if no > fallback_high:
@@ -314,8 +325,6 @@ def install(bt, engine, fd):
                 bulk_row_by_id[row["fixture_id"]] = row
             fixture_by_key[bt._fixture_key_from_row(row)] = fixture
 
-        # Deep historical odds: prioritize fixtures where bulk hints show extra markets,
-        # then the strongest estimated candidates. Four/day keeps the Pro cost bounded.
         def deep_score(fixture):
             parsed = bt._extract_inline_odds(fixture)
             names = " ".join(str(k).lower() for k in (parsed.keys() if isinstance(parsed, dict) else []))
@@ -424,6 +433,7 @@ def install(bt, engine, fd):
                 mix[kind] = mix.get(kind, 0) + int(n or 0)
         solists = mix.get("1X2", 0)
         non_solists = max(0, legs - solists)
+        strict_no_1x2 = float(target) <= 3.0
         out.update({
             "average_legs": round(legs / len(settled), 2) if settled else 0.0,
             "market_mix": mix,
@@ -433,7 +443,12 @@ def install(bt, engine, fd):
             "page2_days": sum(bool(x.get("page2_used")) for x in daily),
             "deep_network_calls": sum(int(x.get("deep_network_calls") or 0) for x in daily),
             "deep_success": sum(int(x.get("deep_success") or 0) for x in daily),
-            "note": "Quality mode: minimum 2 selecții pentru cote normale, max. 1 solist 1X2/bilet, shortlist cu cote Bet365 complete și până la 100 meciuri/zi. Prima rulare poate dura mai mult; deep odds se cache-uiesc.",
+            "quality_mode": "FARA_1X2" if strict_no_1x2 else "MAX_1X2",
+            "note": (
+                "Quality v2: la cote cerute <=3.00 nu foloseste deloc 1/X/2; cauta Goals/AH/BTTS/Corners/Cards, "
+                "minimum 2 selectii si 8 meciuri/zi cu cote Bet365 complete. Pentru cote mai mari permite maximum un 1X2. "
+                "Prima rulare poate dura mai mult; deep odds se cache-uiesc."
+            ),
         })
         return out
 
