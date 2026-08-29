@@ -1,7 +1,7 @@
 """Configurable ticket constraints for Analiza Cota AI.
 
-This layer keeps the existing sport analysis intact and only changes how the final
-multi-event ticket is built when the user explicitly sets limits.
+This layer keeps sport analysis intact and changes only how the final multi-event
+ ticket is built when the user sets ticket/selection limits.
 """
 import math
 
@@ -35,45 +35,110 @@ def _positive_int(value):
         return 0
 
 
-def has_custom_constraints(odds_min=0, odds_max=0, min_legs=0, max_legs=0):
+def has_custom_constraints(
+    odds_min=0,
+    odds_max=0,
+    min_legs=0,
+    max_legs=0,
+    leg_odds_min=0,
+    leg_odds_max=0,
+):
     return any(
         (
             _positive_float(odds_min),
             _positive_float(odds_max),
             _positive_int(min_legs),
             _positive_int(max_legs),
+            _positive_float(leg_odds_min),
+            _positive_float(leg_odds_max),
         )
     )
 
 
-def build_combo(rows, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
-    """Build the safest ticket inside explicit total-odds and leg-count limits.
+def _candidate_fixtures(rows, target, leg_odds_min=0, leg_odds_max=0):
+    """Return at most one option set per event, respecting per-selection odds."""
+    target = float(target)
+    leg_odds_min = _positive_float(leg_odds_min) or 1.02
+    explicit_max = _positive_float(leg_odds_max)
 
-    At most one selection is used from each event. Joint probability remains the
-    primary objective, then closeness to the requested target and lower max leg odds.
-    """
+    if target >= 50:
+        min_prob, default_max = 0.49, 2.40
+    elif target >= 10:
+        min_prob, default_max = 0.53, 3.00
+    elif target >= 5:
+        min_prob, default_max = 0.55, 3.30
+    else:
+        min_prob, default_max = 0.57, 3.50
+
+    max_odd = explicit_max or default_max
+    fixtures = []
+    for row in rows:
+        opts = []
+        for pick in row.get("markets", []):
+            try:
+                odd = float(pick.get("bookmaker_odds") or 0)
+                prob = float(pick.get("ticket_probability") or pick.get("probability") or 0) / 100.0
+            except (TypeError, ValueError):
+                continue
+            if pick.get("suspicious") or prob < min_prob:
+                continue
+            if odd < leg_odds_min or odd > max_odd:
+                continue
+            opts.append(
+                {
+                    **pick,
+                    "home": row["home"],
+                    "away": row["away"],
+                    "kickoff": row.get("kickoff"),
+                    "combo_prob": prob,
+                }
+            )
+        if opts:
+            opts.sort(
+                key=lambda x: (
+                    x["combo_prob"],
+                    x.get("recommendation_score", 0),
+                    -x["bookmaker_odds"],
+                ),
+                reverse=True,
+            )
+            fixtures.append(opts[:8])
+    return fixtures
+
+
+def build_combo(
+    rows,
+    target,
+    odds_min=0,
+    odds_max=0,
+    min_legs=0,
+    max_legs=0,
+    leg_odds_min=0,
+    leg_odds_max=0,
+):
+    """Build the safest ticket inside explicit total and per-selection limits."""
     target = max(1.01, float(target))
     odds_min = _positive_float(odds_min)
     odds_max = _positive_float(odds_max)
     min_legs = _positive_int(min_legs) or 1
-    max_legs = _positive_int(max_legs) or 20
-    max_legs = min(max_legs, 30)
+    max_legs = min(_positive_int(max_legs) or 20, 30)
+    leg_odds_min = _positive_float(leg_odds_min)
+    leg_odds_max = _positive_float(leg_odds_max)
 
     if min_legs > max_legs:
         raise ValueError("Numărul minim de meciuri nu poate fi mai mare decât maximul")
     if odds_min and odds_max and odds_min > odds_max:
-        raise ValueError("Cota minimă nu poate fi mai mare decât cota maximă")
+        raise ValueError("Cota minimă a biletului nu poate fi mai mare decât cota maximă")
+    if leg_odds_min and leg_odds_max and leg_odds_min > leg_odds_max:
+        raise ValueError("Cota minimă per meci nu poate fi mai mare decât cota maximă")
 
-    preferred_lo, preferred_hi, fallback_lo, fallback_hi, max_leg_odd = _bands(target)
+    preferred_lo, preferred_hi, fallback_lo, fallback_hi, default_leg_max = _bands(target)
     explicit_odds = bool(odds_min or odds_max)
 
     if explicit_odds:
-        low = odds_min or 1.01
-        high = odds_max or 500.0
-        high = min(high, 500.0)
-        low = max(1.01, low)
-        preferred_low = low
-        preferred_high = high
+        low = max(1.01, odds_min or 1.01)
+        high = min(500.0, odds_max or 500.0)
+        preferred_low, preferred_high = low, high
     else:
         low = target * fallback_lo
         high = target * fallback_hi
@@ -81,11 +146,11 @@ def build_combo(rows, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
         preferred_high = target * preferred_hi
 
     if low > high:
-        raise ValueError("Intervalul de cotă este invalid")
+        raise ValueError("Intervalul de cotă al biletului este invalid")
 
-    fixtures = market_engine._combo_candidates(rows, target)
-    # Five alternatives/event are enough for range fitting and keep custom searches fast.
-    fixtures = [opts[:5] for opts in fixtures if opts]
+    fixtures = _candidate_fixtures(rows, target, leg_odds_min, leg_odds_max)
+    effective_leg_min = leg_odds_min or 1.02
+    effective_leg_max = leg_odds_max or default_leg_max
 
     diag = {
         "candidate_matches": len(fixtures),
@@ -96,6 +161,8 @@ def build_combo(rows, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
         "requested_odds_max": round(high, 2),
         "requested_min_legs": min_legs,
         "requested_max_legs": max_legs,
+        "requested_leg_odds_min": round(effective_leg_min, 2),
+        "requested_leg_odds_max": round(effective_leg_max, 2),
         "closest_reachable_odds": None,
         "max_leg_odds_used": None,
         "best_joint_probability": None,
@@ -104,19 +171,19 @@ def build_combo(rows, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
     if not fixtures:
         return None, diag
 
-    # Keep a separate state for each odds bucket + leg count. Without leg count in
-    # the key, a high-probability 2-leg path can incorrectly erase a needed 4-leg path.
+    # State key includes odds bucket and number of legs so leg-count constraints
+    # cannot be erased by a shorter path in the same odds bucket.
     scale = 120
     states = {(0, 0): (1.0, 1.0, [], 1.0)}
 
     for fixture_opts in fixtures:
-        nxt = dict(states)  # skipping the event is allowed
+        nxt = dict(states)
         for cur_odd, joint, path, path_max_leg in list(states.values()):
             if len(path) >= max_legs:
                 continue
             for x in fixture_opts:
                 odd = float(x.get("bookmaker_odds") or 0)
-                if odd <= 1.01 or odd > max_leg_odd:
+                if odd < effective_leg_min or odd > effective_leg_max:
                     continue
                 no = cur_odd * odd
                 if no > high:
@@ -179,6 +246,8 @@ def build_combo(rows, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
             "requested_odds_max": round(high, 2),
             "requested_min_legs": min_legs,
             "requested_max_legs": max_legs,
+            "requested_leg_odds_min": round(effective_leg_min, 2),
+            "requested_leg_odds_max": round(effective_leg_max, 2),
             "average_leg_odds": round(odd ** (1.0 / len(path)), 2),
             "max_leg_odds": round(max(x["bookmaker_odds"] for x in path), 2),
             "matches": [
@@ -200,9 +269,24 @@ def build_combo(rows, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
     )
 
 
-def apply(result, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
-    """Replace only the final combo; preserve all sport-specific analysis/ranking."""
-    if not has_custom_constraints(odds_min, odds_max, min_legs, max_legs):
+def apply(
+    result,
+    target,
+    odds_min=0,
+    odds_max=0,
+    min_legs=0,
+    max_legs=0,
+    leg_odds_min=0,
+    leg_odds_max=0,
+):
+    if not has_custom_constraints(
+        odds_min,
+        odds_max,
+        min_legs,
+        max_legs,
+        leg_odds_min,
+        leg_odds_max,
+    ):
         return result
 
     combo, diag = build_combo(
@@ -212,6 +296,8 @@ def apply(result, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
         odds_max=odds_max,
         min_legs=min_legs,
         max_legs=max_legs,
+        leg_odds_min=leg_odds_min,
+        leg_odds_max=leg_odds_max,
     )
     result["suggested_combo"] = combo
     result["combo_diagnostics"] = diag
@@ -220,5 +306,7 @@ def apply(result, target, odds_min=0, odds_max=0, min_legs=0, max_legs=0):
         "odds_max": diag["requested_odds_max"],
         "min_legs": diag["requested_min_legs"],
         "max_legs": diag["requested_max_legs"],
+        "leg_odds_min": diag["requested_leg_odds_min"],
+        "leg_odds_max": diag["requested_leg_odds_max"],
     }
     return result
