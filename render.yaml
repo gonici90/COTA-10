@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server_v6:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn server_v7:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: FIVEDOLLAR_API_KEY
         sync: false
