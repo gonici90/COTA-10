@@ -7,7 +7,7 @@ from fastapi import HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 import server_v2  # installs tennis coverage patch before server is used
-import server as base_server
+import server_base as base_server
 import market_engine
 import odds_sports
 import ticket_constraints
@@ -28,7 +28,7 @@ def _drop_get(path):
     ]
 
 
-# Replace only these endpoints from server.py.
+# Replace only these endpoints from the base app.
 for _path in ("/", "/api/analyze", "/health"):
     _drop_get(_path)
 
@@ -177,7 +177,6 @@ def home():
   const url='/api/analyze?'+params.toString();'''
     html = html.replace(old_url, new_url, 1)
 
-    # Show the effective constraints returned by the backend above the ticket.
     marker = "if(x.sources){"
     summary = r'''if(x.ticket_constraints||x.period_days_is_custom){
    const tc=x.ticket_constraints||{};
