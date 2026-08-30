@@ -1,4 +1,4 @@
-"""Analiza Cota AI v10.3: Big-5 CSV walk-forward with practical cota-2 tickets."""
+"""Analiza Cota AI v10.4: Big-5 CSV walk-forward using real historical bookmaker odds only."""
 from collections import defaultdict
 from itertools import combinations
 import math
@@ -8,18 +8,25 @@ from fastapi.responses import HTMLResponse
 import server_v7, offline_backtest, odds_sports, backtest_engine
 
 app = server_v7.app
-app.version = '10.3'
+app.version = '10.4'
 
 
-# Ticket policy requested for the practical backtest:
-# - only 1X2, double chance and goal totals
-# - around target 2, prefer 2-3 legs and keep final odds tight (1.90-2.10)
-# - do not force a ticket when there is no acceptable combination
-_ALLOWED_MARKETS = {
-    '1', 'X', '2', '1X', 'X2', '12',
-    'Over 1.5', 'Under 1.5', 'Over 2.5', 'Under 2.5',
-    'Over 3.5', 'Under 3.5'
-}
+# Historical-price integrity rule:
+# Football-Data CSVs in this repo expose real bookmaker/market prices for
+# 1/X/2 and Over/Under 2.5. Other lines previously used derived/model prices,
+# which are not suitable for an honest profitability backtest.
+_REAL_ODDS_MARKETS = {'1', 'X', '2', 'Over 2.5', 'Under 2.5'}
+_original_probs = offline_backtest._probs
+
+
+def _real_market_probs(home_lambda, away_lambda):
+    probs = _original_probs(home_lambda, away_lambda)
+    return {m: p for m, p in probs.items() if m in _REAL_ODDS_MARKETS}
+
+
+# This also prevents a synthetic market from winning the per-match candidate
+# ranking before the ticket builder sees the match.
+offline_backtest._probs = _real_market_probs
 
 
 def _quality_ticket_for_day(day_picks, target):
@@ -41,7 +48,7 @@ def _quality_ticket_for_day(day_picks, target):
 
     pool = []
     for p in day_picks:
-        if p.get('market') not in _ALLOWED_MARKETS:
+        if p.get('market') not in _REAL_ODDS_MARKETS:
             continue
         try:
             probability = float(p.get('probability') or 0) / 100.0
@@ -50,7 +57,6 @@ def _quality_ticket_for_day(day_picks, target):
             continue
         if probability < min_p or not (1.12 <= odds <= max_o):
             continue
-        # Keep the historical guardrails, but less aggressively than v10.2.
         if p.get('trail_sample', 0) >= 18 and p.get('trail_roi', 0) < -12:
             continue
         if p.get('band_sample', 0) >= 15 and (
@@ -77,8 +83,6 @@ def _quality_ticket_for_day(day_picks, target):
             if odd < low_ticket or odd > high_ticket:
                 continue
 
-            # Around cota 2, singles are allowed only when they are themselves
-            # very close to the requested price and sufficiently strong.
             if near_two and z == 1:
                 p0 = float(c[0].get('probability') or 0) / 100.0
                 if not (target * .96 <= odd <= target * 1.04 and p0 >= .68):
@@ -87,8 +91,6 @@ def _quality_ticket_for_day(day_picks, target):
             avg_p = sum(float(p.get('probability') or 0) for p in c) / z
             avg_ev = sum(float(p.get('ev') or 0) for p in c) / z
             avg_band = sum(float(p.get('band_score') or 0) for p in c) / z
-
-            # Prefer 2 legs near target 2, then 3; exact target remains primary.
             leg_penalty = (abs(z - 2) * .006) if near_two else (z * .006)
             score = (
                 abs(math.log(odd / target))
@@ -126,7 +128,6 @@ def _quality_ticket_for_day(day_picks, target):
     }
 
 
-# Apply the policy to all offline ticket backtests in this process.
 offline_backtest._ticket_for_day = _quality_ticket_for_day
 
 
@@ -151,7 +152,7 @@ def _summary(days, target, data, tb):
         'fixtures_seen': int(cov.get('fixtures_found') or 0),
         'fixtures_analyzed': int(cov.get('fixtures_analyzed') or 0),
         'truncated_days': 0,
-        'note': 'Big-5 CSV walk-forward; cota 2 tintita 1.90-2.10, fara fortarea biletului.'
+        'note': 'Big-5 CSV walk-forward; numai cote istorice reale 1/X/2 si Over/Under 2.5.'
     }
 
 
@@ -177,7 +178,7 @@ def _run_csv_job(job_id, days, target):
 
     try:
         with backtest_engine.JOBS_LOCK:
-            backtest_engine.JOBS[job_id]['current_day'] = 'Big 5 CSV walk-forward'
+            backtest_engine.JOBS[job_id]['current_day'] = 'Big 5 CSV / cote reale'
             backtest_engine.JOBS[job_id]['progress'] = 1
 
         offline_backtest._ticket_backtest = capture_ticket_backtest
@@ -246,14 +247,15 @@ for p in ('/', '/health'):
 def health():
     return {
         'status': 'ok',
-        'version': '10.3',
-        'backtest': 'Big-5 CSV walk-forward, tight cota-2 tickets',
+        'version': '10.4',
+        'backtest': 'Big-5 CSV walk-forward, real historical odds only',
         'backtest_leagues': ['Premier League', 'La Liga', 'Serie A', 'Bundesliga', 'Ligue 1'],
         'backtest_cota2_band': '1.90-2.10',
-        'backtest_markets': ['1X2', 'double chance', 'goals'],
+        'backtest_markets': ['1', 'X', '2', 'Over 2.5', 'Under 2.5'],
+        'synthetic_historical_odds': False,
         'multisport_provider': 'The Odds API',
         'the_odds_api_configured': odds_sports.configured(),
-        'ui': 'pro-multisport-v10.3'
+        'ui': 'pro-multisport-v10.4'
     }
 
 
@@ -261,9 +263,9 @@ def health():
 def home():
     response = server_v7.home()
     html = response.body.decode('utf-8')
-    html = html.replace('ENGINE v9.6', 'ENGINE v10.3').replace('engine v9.6', 'engine v10.3')
+    html = html.replace('ENGINE v9.6', 'ENGINE v10.4').replace('engine v9.6', 'engine v10.4')
     html = html.replace(
         'Backtestul folosește cote pre-match/closing disponibile în Pro; tick-history complet este o facilitate separată.',
-        'WALK-FORWARD v10.3: Big 5 CSV. Pentru țintă 2, biletul trebuie să fie între 1.90 și 2.10; preferă 2-3 selecții, permite solistă unică doar dacă este foarte aproape de 2 și suficient de puternică. Piețe: 1/X/2, șanse duble și goluri. Nu forțează bilet.'
+        'WALK-FORWARD v10.4: backtest Big 5 numai pe cote istorice reale disponibile în CSV: 1/X/2 și Over/Under 2.5. Șansele duble și liniile 1.5/3.5 nu mai sunt testate cu prețuri sintetice. Pentru țintă 2, biletul rămâne între 1.90 și 2.10 și nu este forțat.'
     )
     return HTMLResponse(html)
