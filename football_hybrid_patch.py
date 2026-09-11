@@ -1,16 +1,15 @@
 """Hybrid football enrichment for 5DollarFootballAPI Pro.
 
-Bulk scan remains fast. Deep Bet365 odds are fetched for enough competitive
-fixtures to give the ticket optimiser real Goals/AH/BTTS alternatives instead
-of effectively feeding it 1X2-only rows.
+Keep the request inside Render/browser timeout. Full-market calls are paced by the
+provider, so deep enrichment must be small; cached full odds are reused for free.
 """
 import time
 from datetime import datetime, timedelta
 
-# Four deep rows was the reason COTA tickets still became almost all 1X2.
-# Eight is a deliberate compromise with the provider's 10 req/min pacing.
-DETAIL_LIMIT_SHORT = 8
-DETAIL_LIMIT_LONG = 6
+# 8 sequential deep calls at provider pacing can exceed the HTTP timeout.
+# Three fresh calls keep a cold request bounded; cache makes later runs richer.
+DETAIL_LIMIT_SHORT = 3
+DETAIL_LIMIT_LONG = 2
 
 
 def install(engine, fd):
@@ -36,28 +35,29 @@ def install(engine, fd):
                 if not isinstance(f,dict):continue
                 k=_fixture_key(f)
                 if k not in seen:seen.add(k); fs.append(f)
-        attempt=min(len(fs),max(1,min(int(limit),200))); rows=[]; no=[]; errors=[]; fixtures={}
+        attempt=min(len(fs),max(1,min(int(limit),200))); rows=[]; no=[]; errors=[]
         for f in fs[:attempt]:
-            fixtures[_fixture_key(f)]=f
             try:
                 r=engine.analyze_fixture(f); (rows if r.get('best_market') else no).append(r)
             except Exception as e:
                 h,a=engine._teams(f); errors.append({'fixture':f.get('id') or f.get('fixture_id'),'match':h.get('name','?')+' - '+a.get('name','?'),'error':type(e).__name__+': '+str(e)[:180]})
 
-        # Prioritise strong rows that have only the bulk 1X2 trio. Those are precisely
-        # the fixtures where a deep call can unlock Goals, BTTS and Asian Handicap.
         def score(r):
             b=r.get('best_market') or {}; p=float(b.get('ticket_probability') or b.get('probability') or 0)
             only_1x2=all(str(x.get('market')) in {'1','X','2'} for x in (r.get('markets') or []))
             return (only_1x2,p,float(b.get('recommendation_score') or 0))
         rows.sort(key=score,reverse=True)
         detail_limit=DETAIL_LIMIT_SHORT if days<=3 else DETAIL_LIMIT_LONG
-        shortlist=[]
+
+        # Cached full-market rows cost no provider wait: include all of them first.
+        cached_f=[]; fresh_f=[]
         for r in rows:
-            if len(shortlist)>=detail_limit:break
-            fid=r.get('fixture_id')
-            f=next((x for x in fs[:attempt] if (x.get('id') or x.get('fixture_id'))==fid),None)
-            if f is not None:shortlist.append(f)
+            fid=r.get('fixture_id'); f=next((x for x in fs[:attempt] if (x.get('id') or x.get('fixture_id'))==fid),None)
+            if f is None:continue
+            c=engine._ODDS_CACHE.get(fid)
+            if c and time.time()-c[0] < engine.ODDS_CACHE_TTL and engine._has_prices(c[1]):cached_f.append(f)
+            elif len(fresh_f)<detail_limit:fresh_f.append(f)
+        shortlist=cached_f+fresh_f
 
         replacements={}; enriched=0; market_counts={}
         for f in shortlist:
@@ -75,9 +75,8 @@ def install(engine, fd):
         for r in rows:
             k=r.get('fixture_id') or (r.get('home'),r.get('away'),r.get('kickoff')); final.append(replacements.get(k,r))
         final.sort(key=lambda x:(x.get('best_market') or {}).get('recommendation_score',0),reverse=True)
-        combo,diag=engine.build_combo(final,target)
-        diag['deep_market_inventory']=market_counts
-        return {'date':day,'days':days,'period_end':(start+timedelta(days=days-1)).isoformat(),'provider':'5DollarFootballAPI Pro hybrid + Bet365','fixtures_by_day':by_day,'api_fixtures':len(fs),'eligible':len(fs),'attempted':attempt,'analyzed':len(final),'without_usable_odds':max(0,attempt-len(final)),'no_odds_examples':[{'fixture':x.get('fixture_id'),'match':str(x.get('home','?'))+' - '+str(x.get('away','?'))} for x in no[:20]],'analysis_errors':errors,'ranking':final,'suggested_combo':combo,'combo_diagnostics':diag,'hybrid':{'bulk_scan':attempt,'deep_odds_requested':len(shortlist),'deep_odds_enriched':enriched,'deep_limit':detail_limit,'deep_market_inventory':market_counts}}
+        combo,diag=engine.build_combo(final,target); diag['deep_market_inventory']=market_counts
+        return {'date':day,'days':days,'period_end':(start+timedelta(days=days-1)).isoformat(),'provider':'5DollarFootballAPI Pro hybrid + Bet365','fixtures_by_day':by_day,'api_fixtures':len(fs),'eligible':len(fs),'attempted':attempt,'analyzed':len(final),'without_usable_odds':max(0,attempt-len(final)),'no_odds_examples':[{'fixture':x.get('fixture_id'),'match':str(x.get('home','?'))+' - '+str(x.get('away','?'))} for x in no[:20]],'analysis_errors':errors,'ranking':final,'suggested_combo':combo,'combo_diagnostics':diag,'hybrid':{'bulk_scan':attempt,'deep_odds_requested':len(shortlist),'fresh_deep_requests':len(fresh_f),'cached_deep_rows':len(cached_f),'deep_odds_enriched':enriched,'deep_limit':detail_limit,'deep_market_inventory':market_counts}}
 
     engine.analyze_period=analyze_period
     engine.analyze_day=lambda day,target=10,limit=12:analyze_period(day,target,1,limit)
