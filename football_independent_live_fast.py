@@ -1,137 +1,79 @@
-"""Fast history loader for the independent live football model.
+"""Fail-fast history loader for live football.
 
-Keeps the v16 probability model intact, but avoids the old worst case of up to
-9 rate-limited API pages for every new league. Reuses backtest history when
-available, persists live history on disk, and normally needs only one API page.
+Live HTTP requests must never spend minutes paging historical league data. Use
+memory/disk/backtest caches; if history is not already available, make at most
+ONE provider request for that league. This trades a few unanalyzed fixtures on
+a cold cache for predictable response time and no hour-long failed requests.
 """
-import json
-import os
-import time
+import json, os, time
 from pathlib import Path
-
 import football_independent_live as base
 
-CACHE = Path(os.getenv("COTA_CACHE_DIR", "/tmp/cota10-cache")) / "live-independent-history"
-CACHE.mkdir(parents=True, exist_ok=True)
-DISK_TTL = 12 * 3600
-MAX_PAGES = 2
-MIN_TEAM_MATCHES = 4
+CACHE=Path(os.getenv('COTA_CACHE_DIR','/tmp/cota10-cache'))/'live-independent-history'; CACHE.mkdir(parents=True,exist_ok=True)
+DISK_TTL=24*3600
+MAX_PAGES=1
+MIN_TEAM_MATCHES=3
 
 
 def _rows(raw):
-    if isinstance(raw, dict):
-        rows = raw.get("fixtures") or raw.get("data") or []
-        pag = raw.get("pagination") or {}
-    else:
-        rows, pag = raw or [], {}
-    if isinstance(rows, dict):
-        rows = rows.get("fixtures") or rows.get("data") or []
-    return [x for x in rows if isinstance(x, dict)], pag
+    if isinstance(raw,dict): rows=raw.get('fixtures') or raw.get('data') or []; pag=raw.get('pagination') or {}
+    else: rows,pag=raw or [],{}
+    if isinstance(rows,dict): rows=rows.get('fixtures') or rows.get('data') or []
+    return [x for x in rows if isinstance(x,dict)],pag
 
 
-def _team_names(engine, fixture):
-    h, a = engine._teams(fixture)
-    return str(h.get("name") or "").lower(), str(a.get("name") or "").lower()
+def _names(engine,f):
+    h,a=engine._teams(f); return str(h.get('name') or '').lower(),str(a.get('name') or '').lower()
 
 
-def _appearances(engine, rows, wanted):
-    counts = {n: 0 for n in wanted if n}
-    for row in rows:
-        h, a = engine._teams(row)
-        names = {str(h.get("name") or "").lower(), str(a.get("name") or "").lower()}
-        for name in counts:
-            if name in names:
-                counts[name] += 1
-    return counts
+def _usable(engine,rows,f):
+    wanted=[x for x in _names(engine,f) if x]; counts={x:0 for x in wanted}
+    for r in rows:
+        h,a=engine._teams(r); ns={str(h.get('name') or '').lower(),str(a.get('name') or '').lower()}
+        for n in counts:
+            if n in ns:counts[n]+=1
+    return bool(counts) and all(v>=MIN_TEAM_MATCHES for v in counts.values())
 
 
-def _usable(engine, rows, fixture):
-    wanted = _team_names(engine, fixture)
-    counts = _appearances(engine, rows, wanted)
-    return bool(counts) and all(v >= MIN_TEAM_MATCHES for v in counts.values())
-
-
-def _read_disk(path):
+def _read(p):
     try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
-        if time.time() - float(obj.get("saved_at") or 0) <= DISK_TTL:
-            rows = obj.get("matches") or []
-            if isinstance(rows, list):
-                return rows
-    except Exception:
-        pass
-    return None
+        o=json.loads(p.read_text(encoding='utf-8'))
+        if time.time()-float(o.get('saved_at') or 0)<=DISK_TTL:return o.get('matches') or []
+    except Exception:pass
 
 
-def _write_disk(path, rows):
-    try:
-        path.write_text(json.dumps({"saved_at": time.time(), "matches": rows}, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+def _write(p,rows):
+    try:p.write_text(json.dumps({'saved_at':time.time(),'matches':rows},ensure_ascii=False),encoding='utf-8')
+    except Exception:pass
 
 
-def _backtest_cache(engine, lid, fixture):
-    root = Path(os.getenv("COTA_CACHE_DIR", "/tmp/cota10-cache")) / "backtest-pro-wf-v12" / "ranges"
-    try:
-        candidates = sorted(root.glob(f"*-{lid}.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    except Exception:
-        return None
-    cutoff = engine._kickoff_ts(fixture)
-    for path in candidates[:4]:
+def _backtest(engine,lid,f):
+    root=Path(os.getenv('COTA_CACHE_DIR','/tmp/cota10-cache'))/'backtest-pro-wf-v12'/'ranges'; cutoff=engine._kickoff_ts(f)
+    try: ps=sorted(root.glob(f'*-{lid}.json'),key=lambda p:p.stat().st_mtime,reverse=True)
+    except Exception:return None
+    for p in ps[:4]:
         try:
-            obj = json.loads(path.read_text(encoding="utf-8"))
-            rows = [x for x in (obj.get("matches") or []) if isinstance(x, dict) and engine._kickoff_ts(x) < cutoff]
-            rows.sort(key=engine._kickoff_ts)
-            if _usable(engine, rows, fixture):
-                return rows
-        except Exception:
-            continue
-    return None
+            o=json.loads(p.read_text(encoding='utf-8')); rows=[x for x in (o.get('matches') or []) if isinstance(x,dict) and engine._kickoff_ts(x)<cutoff]; rows.sort(key=engine._kickoff_ts)
+            if _usable(engine,rows,f):return rows
+        except Exception:continue
 
 
-def fast_history(engine, fd, fixture):
-    lid = base._league_id(fixture)
-    if not lid:
-        return []
-    key = str(lid)
-    now = time.time()
-
-    cached = base._HISTORY.get(key)
-    if cached and now - cached[0] < base.TTL:
-        return cached[1]
-
-    disk = CACHE / f"{key}.json"
-    rows = _read_disk(disk)
-    if rows is not None and _usable(engine, rows, fixture):
-        base._HISTORY[key] = (now, rows)
-        return rows
-
-    rows = _backtest_cache(engine, lid, fixture)
-    if rows:
-        base._HISTORY[key] = (now, rows)
-        _write_disk(disk, rows)
-        return rows
-
-    kickoff = engine._kickoff_ts(fixture)
-    end = max(1, kickoff - 1)
-    start = end - base.HISTORY_DAYS * 86400
-    rows = []
-    for page in range(1, MAX_PAGES + 1):
-        raw = fd._get(
-            f"/leagues/{lid}/fixtures",
-            {"start_time": start, "end_time": end, "status": "finished", "per_page": 50, "page": page, "lang": "en"},
-        )
-        part, pag = _rows(raw)
-        rows.extend(part)
-        if _usable(engine, rows, fixture) or not pag.get("has_more"):
-            break
-
+def fast_history(engine,fd,f):
+    lid=base._league_id(f)
+    if not lid:return []
+    key=str(lid); now=time.time(); c=base._HISTORY.get(key)
+    if c and now-c[0]<base.TTL:return c[1]
+    disk=CACHE/f'{key}.json'; rows=_read(disk)
+    if rows is not None and _usable(engine,rows,f):base._HISTORY[key]=(now,rows); return rows
+    rows=_backtest(engine,lid,f)
+    if rows:base._HISTORY[key]=(now,rows); _write(disk,rows); return rows
+    # Cold-cache safety: ONE history call only. Never paginate inside a live request.
+    ko=engine._kickoff_ts(f); end=max(1,ko-1); start=end-base.HISTORY_DAYS*86400
+    try: raw=fd._get(f'/leagues/{lid}/fixtures',{'start_time':start,'end_time':end,'status':'finished','per_page':50,'page':1,'lang':'en'}); rows,_=_rows(raw)
+    except Exception: rows=[]
     rows.sort(key=engine._kickoff_ts)
-    base._HISTORY[key] = (now, rows)
-    _write_disk(disk, rows)
+    base._HISTORY[key]=(now,rows); _write(disk,rows)
     return rows
 
-
-# Patch only data loading. Prediction math, Elo/form/H2H and odds separation stay unchanged.
-base._history = fast_history
-install = base.install
+base._history=fast_history
+install=base.install
