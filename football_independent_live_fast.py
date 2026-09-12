@@ -1,5 +1,7 @@
-"""History loader with two modes: fast scanner and deep single-match analysis."""
-import json, os, time
+"""History loader with fast scanner and deep single-match analysis.
+Team history matching prefers stable provider team IDs and falls back to normalized names.
+"""
+import json, os, time, re, unicodedata
 from pathlib import Path
 import football_independent_live as base
 CACHE=Path(os.getenv('COTA_CACHE_DIR','/tmp/cota10-cache'))/'live-independent-history';CACHE.mkdir(parents=True,exist_ok=True)
@@ -11,23 +13,52 @@ def _rows(raw):
     if isinstance(rows,dict):rows=rows.get('fixtures') or rows.get('data') or []
     return [x for x in rows if isinstance(x,dict)],pag
 
-def _names(engine,f):
-    h,a=engine._teams(f);return str(h.get('name') or '').lower(),str(a.get('name') or '').lower()
+def _team_id(t):
+    if not isinstance(t,dict):return None
+    v=t.get('id') or t.get('team_id') or t.get('teamId')
+    return str(v) if v not in (None,'') else None
+
+def _norm(v):
+    s=unicodedata.normalize('NFKD',str(v or '')).encode('ascii','ignore').decode().lower()
+    s=s.replace('&',' and ')
+    s=re.sub(r'\b(fc|cf|afc|sc|ac|fk|nk|sk|sv|club|football|calcio)\b',' ',s)
+    s=re.sub(r'[^a-z0-9]+',' ',s)
+    aliases={'man utd':'manchester united','man city':'manchester city','tottenham hotspur':'tottenham','spurs':'tottenham','paris saint germain':'psg','internazionale':'inter','inter milan':'inter','bayern munchen':'bayern munich','borussia monchengladbach':'monchengladbach'}
+    s=' '.join(s.split())
+    return aliases.get(s,s)
+
+def _identity(engine,f):
+    h,a=engine._teams(f)
+    return ((_team_id(h),_norm(h.get('name') if isinstance(h,dict) else h)),(_team_id(a),_norm(a.get('name') if isinstance(a,dict) else a)))
+
+def _same(target,candidate):
+    tid,tname=target;cid,cname=candidate
+    if tid and cid:return tid==cid
+    if tname and cname:
+        if tname==cname:return True
+        # conservative fallback for provider suffix/prefix variants
+        ta=set(tname.split());ca=set(cname.split())
+        return len(ta&ca)>=2 and (ta<=ca or ca<=ta)
+    return False
+
 def _usable(engine,rows,f):
-    wanted=[x for x in _names(engine,f) if x];counts={x:0 for x in wanted}
+    wanted=list(_identity(engine,f));counts=[0,0]
     for r in rows:
-        h,a=engine._teams(r);ns={str(h.get('name') or '').lower(),str(a.get('name') or '').lower()}
-        for n in counts:
-            if n in ns:counts[n]+=1
-    return bool(counts) and all(v>=MIN_TEAM_MATCHES for v in counts.values())
+        rh,ra=_identity(engine,r)
+        for i,w in enumerate(wanted):
+            if _same(w,rh) or _same(w,ra):counts[i]+=1
+    return all(v>=MIN_TEAM_MATCHES for v in counts)
+
 def _read(p):
     try:
         o=json.loads(p.read_text(encoding='utf-8'))
         if time.time()-float(o.get('saved_at') or 0)<=DISK_TTL:return o.get('matches') or []
     except Exception:pass
+
 def _write(p,rows):
     try:p.write_text(json.dumps({'saved_at':time.time(),'matches':rows},ensure_ascii=False),encoding='utf-8')
     except Exception:pass
+
 def _backtest(engine,lid,f):
     root=Path(os.getenv('COTA_CACHE_DIR','/tmp/cota10-cache'))/'backtest-pro-wf-v12'/'ranges';cutoff=engine._kickoff_ts(f)
     try:ps=sorted(root.glob(f'*-{lid}.json'),key=lambda p:p.stat().st_mtime,reverse=True)
@@ -56,17 +87,20 @@ def fast_history(engine,fd,f):
     if rows is not None and _usable(engine,rows,f):base._HISTORY[key]=(now,rows);return rows
     rows=_backtest(engine,lid,f)
     if rows:base._HISTORY[key]=(now,rows);_write(disk,rows);return rows
-    # Scanner remains fail-fast: one page.
     rows=_fetch(engine,fd,f,1);base._HISTORY[key]=(now,rows);_write(disk,rows);return rows
 
 def deep_history(engine,fd,f,max_pages=6):
-    """For an explicitly selected match only. Fetch pages until both teams have history."""
+    """Explicit match only: paginate until both team identities have enough history."""
     lid=base._league_id(f)
     if not lid:return []
     key=str(lid);now=time.time();c=base._HISTORY.get(key)
     if c and _usable(engine,c[1],f):return c[1]
+    disk=CACHE/f'{key}.json';rows=_read(disk)
+    if rows is not None and _usable(engine,rows,f):base._HISTORY[key]=(now,rows);return rows
+    rows=_backtest(engine,lid,f)
+    if rows:base._HISTORY[key]=(now,rows);_write(disk,rows);return rows
     rows=_fetch(engine,fd,f,max_pages)
-    if rows:base._HISTORY[key]=(now,rows);_write(CACHE/f'{key}.json',rows)
+    if rows:base._HISTORY[key]=(now,rows);_write(disk,rows)
     return rows
 
 base._history=fast_history
